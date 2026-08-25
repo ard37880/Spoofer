@@ -1,0 +1,10 @@
+# Local run output
+*.log
+backups/
+
+# Editor and OS noise
+.vs/
+.vscode/
+*.swp
+Thumbs.db
+desktop.ini
