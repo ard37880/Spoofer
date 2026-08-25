@@ -7,16 +7,21 @@
 .DESCRIPTION
     Spoofer changes the identifiers Windows exposes to software: the
     cryptography machine GUID, telemetry and update client ids, the hardware
-    profile GUID, the cached SMBIOS description, the hostname, adapter MAC
-    addresses, disk and volume serials, and more.
+    profile GUID, the cached SMBIOS description, the digital product id, the
+    hostname, adapter MAC addresses, monitor EDID serials, disk and volume
+    serials, and more.
+
+    Every module runs by default, including the ones that can disturb licensing
+    or the boot configuration. -Interactive gives you a checklist to tick instead,
+    and -Exclude drops individual modules from a run.
 
     Nothing is changed without first being written to a backup session under
     %ProgramData%\Spoofer\backups. -Action Restore replays a session and returns
     the machine to exactly the state it was in.
 
-    Run it on hardware you own or administer. Changing these values will log
-    you out of software that licensed itself to this machine and can trip the
-    fraud checks of services that expect a stable device identity.
+    Run it on hardware you own or administer. Changing these values will log you
+    out of software that licensed itself to this machine and can trip the fraud
+    checks of services that expect a stable device identity.
 
 .PARAMETER Action
     Status   Show the current value of every identifier (default).
@@ -26,15 +31,21 @@
     Remove   Delete a stored backup session.
     Modules  Describe the available modules.
 
+.PARAMETER Interactive
+    Show a checklist of every module and pick which ones to run. Ticked entries
+    can be toggled by number or by name before the run starts.
+
 .PARAMETER Module
-    Module names to act on, e.g. -Module machineguid,mac. 'all' selects every
-    module including the Risky tier. Defaults to the Standard and Advanced tiers.
+    Run only these modules, e.g. -Module machineguid,mac.
+
+.PARAMETER Exclude
+    Drop these modules from whatever the rest of the selection produced.
 
 .PARAMETER Tier
     Select by tier instead of by name: Standard, Advanced or Risky.
 
-.PARAMETER IncludeRisky
-    Add the Risky tier to the default selection.
+.PARAMETER SafeOnly
+    Shorthand for the Standard and Advanced tiers, leaving out the Risky ones.
 
 .PARAMETER Seed
     Generate identifiers deterministically from this seed. The same seed always
@@ -48,27 +59,28 @@
 .PARAMETER DryRun
     Show every change that would be made and write nothing.
 
-.PARAMETER Force
-    Proceed past guards that exist for a reason: renaming a domain-joined
-    machine, replaying an already-restored backup.
+.PARAMETER NoElevate
+    Fail rather than prompting for elevation. Intended for unattended runs that
+    are already elevated, and it stops an elevation loop if the prompt is declined.
 
 .PARAMETER Yes
-    Skip the confirmation prompt. Intended for unattended runs.
+    Skip the confirmation prompt.
 
 .EXAMPLE
     .\Spoofer.ps1 -Action Status
 
 .EXAMPLE
-    .\Spoofer.ps1 -Action Spoof -DryRun
+    .\Spoofer.ps1 -Action Spoof -Interactive
 
 .EXAMPLE
-    .\Spoofer.ps1 -Action Spoof -Module machineguid,machineid,mac
+    .\Spoofer.ps1 -Action Spoof -DryRun
 
 .EXAMPLE
     .\Spoofer.ps1 -Action Restore -BackupId latest
 
 .NOTES
-    Requires an elevated 64-bit PowerShell session for -Action Spoof and Restore.
+    Needs an elevated 64-bit PowerShell for Spoof and Restore. It will ask for
+    elevation itself unless -NoElevate is given.
 #>
 
 [CmdletBinding()]
@@ -76,12 +88,16 @@ param(
     [ValidateSet('Status', 'Spoof', 'Restore', 'List', 'Remove', 'Modules')]
     [string]$Action = 'Status',
 
+    [switch]$Interactive,
+
     [string[]]$Module,
+
+    [string[]]$Exclude,
 
     [ValidateSet('Standard', 'Advanced', 'Risky')]
     [string[]]$Tier,
 
-    [switch]$IncludeRisky,
+    [switch]$SafeOnly,
 
     [AllowNull()]
     [Nullable[int]]$Seed,
@@ -96,9 +112,15 @@ param(
 
     [switch]$Yes,
 
+    [switch]$NoElevate,
+
     [switch]$IncludeVirtualAdapters,
 
-    [switch]$AllowVolumeDismount,
+    [switch]$IncludeRemovableVolumes,
+
+    [switch]$SkipDomainRename,
+
+    [switch]$NoVolumeDismount,
 
     [switch]$NoRestartPrompt,
 
@@ -122,6 +144,72 @@ Get-Module |
 foreach ($name in @('Common', 'Native', 'BackupStore', 'RegistryHelper', 'ProviderCommon', 'ProviderRegistry')) {
     Import-Module (Join-Path $modulePath "$name.psm1") -DisableNameChecking
 }
+
+#region Elevation
+
+function Test-SpooferActionNeedsAdmin {
+    param([string]$Name)
+    return ($Name -in @('Spoof', 'Restore'))
+}
+
+function Invoke-SpooferRelaunchElevated {
+    <#
+    .SYNOPSIS
+        Relaunches this script elevated with the same arguments.
+    .DESCRIPTION
+        The child is started with -NoExit so its output stays on screen in the
+        new window, and with -NoElevate so a declined or ineffective prompt
+        produces an error rather than another elevation attempt.
+    .OUTPUTS
+        $true when a child was started and this process should stop.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)]
+        [hashtable]$BoundParameters
+    )
+
+    $host_ = (Get-Process -Id $PID).Path
+    if (-not $host_) { $host_ = 'powershell.exe' }
+
+    $arguments = New-Object System.Collections.ArrayList
+    foreach ($item in @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-NoExit', '-File', ('"{0}"' -f $PSCommandPath))) {
+        [void]$arguments.Add($item)
+    }
+
+    foreach ($entry in $BoundParameters.GetEnumerator()) {
+        if ($entry.Key -eq 'NoElevate') { continue }
+
+        $value = $entry.Value
+
+        if ($value -is [System.Management.Automation.SwitchParameter]) {
+            if ($value.IsPresent) { [void]$arguments.Add('-{0}' -f $entry.Key) }
+            continue
+        }
+
+        [void]$arguments.Add('-{0}' -f $entry.Key)
+        if ($value -is [System.Array]) {
+            [void]$arguments.Add('"{0}"' -f (@($value) -join ','))
+        } else {
+            [void]$arguments.Add('"{0}"' -f $value)
+        }
+    }
+
+    [void]$arguments.Add('-NoElevate')
+
+    Write-SpooferLog -Level Info -Message 'Asking Windows for administrator rights; approve the prompt to continue in the new window.'
+
+    try {
+        Start-Process -FilePath $host_ -ArgumentList @($arguments) -Verb RunAs -ErrorAction Stop | Out-Null
+        return $true
+    } catch {
+        Write-SpooferLog -Level Error -Message "Elevation was declined or failed: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+#endregion
 
 #region Presentation
 
@@ -164,7 +252,10 @@ function Test-Environment {
         throw 'This is a 32-bit PowerShell on 64-bit Windows. Registry writes would be redirected into WOW6432Node and would not touch the real identifiers. Start the 64-bit PowerShell from C:\Windows\System32\WindowsPowerShell\v1.0.'
     }
 
-    if ($RequireAdmin) { Assert-SpooferAdmin }
+    if ($RequireAdmin) {
+        Assert-SpooferAdmin
+        Enable-SpooferPrivilegeSet | Out-Null
+    }
 }
 
 function Confirm-Action {
@@ -189,28 +280,184 @@ function Confirm-Action {
     return $false
 }
 
+#endregion
+
+#region Module selection
+
+function Show-ModuleChecklist {
+    <#
+    .SYNOPSIS
+        Draws the checklist and its key.
+    #>
+    param(
+        [Parameter(Mandatory)][object[]]$Provider,
+        [Parameter(Mandatory)][hashtable]$Selected
+    )
+
+    Write-Host ''
+    Write-Host '  Pick what to change' -ForegroundColor White
+    Write-Host '  ------------------------------------------------------------------------' -ForegroundColor DarkGray
+
+    for ($i = 0; $i -lt $Provider.Count; $i++) {
+        $item = $Provider[$i]
+        $tick = if ($Selected[$item.Name]) { 'x' } else { ' ' }
+
+        $colour = switch ($item.Tier) {
+            'Risky'    { 'Red' }
+            'Advanced' { 'Yellow' }
+            default    { 'Gray' }
+        }
+
+        Write-Host ('   {0,2}. [{1}] ' -f ($i + 1), $tick) -ForegroundColor $(if ($Selected[$item.Name]) { 'Green' } else { 'DarkGray' }) -NoNewline
+        Write-Host ('{0,-18}' -f $item.Name) -ForegroundColor White -NoNewline
+        Write-Host ('{0,-10}' -f $item.Tier) -ForegroundColor $colour -NoNewline
+        Write-Host ('{0}{1}' -f $item.Title, $(if ($item.RequiresReboot) { '  (restart required)' } else { '' })) -ForegroundColor DarkGray
+    }
+
+    $count = @($Selected.Keys | Where-Object { $Selected[$_] }).Count
+
+    Write-Host '  ------------------------------------------------------------------------' -ForegroundColor DarkGray
+    Write-Host ('   {0} of {1} selected' -f $count, $Provider.Count) -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host '   Toggle : numbers or names, e.g. "1 4 7" or "mac volumeserial"' -ForegroundColor DarkGray
+    Write-Host '   a all   n none   s standard   d advanced   r risky   i invert' -ForegroundColor DarkGray
+    Write-Host '   Enter to run the ticked modules, q to cancel' -ForegroundColor DarkGray
+}
+
+function Select-SpooferModuleInteractive {
+    <#
+    .SYNOPSIS
+        Runs the checklist and returns the chosen providers.
+    .OUTPUTS
+        The selected provider descriptors, or $null when cancelled.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object[]]$Provider,
+        [string[]]$PreSelected
+    )
+
+    $selected = @{}
+    foreach ($item in $Provider) {
+        $selected[$item.Name] = ($null -eq $PreSelected) -or ($PreSelected -contains $item.Name)
+    }
+
+    while ($true) {
+        Show-ModuleChecklist -Provider $Provider -Selected $selected
+
+        $input_ = (Read-Host '   >').Trim()
+
+        if ($input_ -eq '') {
+            $chosen = @($Provider | Where-Object { $selected[$_.Name] })
+            if ($chosen.Count -eq 0) {
+                Write-SpooferLog -Level Warn -Message 'Nothing is ticked. Tick at least one module, or press q to cancel.'
+                continue
+            }
+            return $chosen
+        }
+
+        # Written as if/elseif rather than a switch: 'continue' inside a switch
+        # leaves the switch and falls through to the code after it, which would
+        # then try to read the same word as a module name.
+        if ($input_ -match '^(q|quit|cancel)$') { return $null }
+
+        if ($input_ -match '^(a|all)$') {
+            foreach ($item in $Provider) { $selected[$item.Name] = $true }
+            continue
+        }
+        if ($input_ -match '^(n|none)$') {
+            foreach ($item in $Provider) { $selected[$item.Name] = $false }
+            continue
+        }
+        if ($input_ -match '^(i|invert)$') {
+            foreach ($item in $Provider) { $selected[$item.Name] = -not $selected[$item.Name] }
+            continue
+        }
+        if ($input_ -match '^(s|standard)$') {
+            foreach ($item in $Provider) { $selected[$item.Name] = ($item.Tier -eq 'Standard') }
+            continue
+        }
+        if ($input_ -match '^(d|advanced)$') {
+            foreach ($item in $Provider) { $selected[$item.Name] = ($item.Tier -eq 'Advanced') }
+            continue
+        }
+        if ($input_ -match '^(r|risky)$') {
+            foreach ($item in $Provider) { $selected[$item.Name] = ($item.Tier -eq 'Risky') }
+            continue
+        }
+
+        # Anything else is a list of numbers and/or module names to toggle.
+        foreach ($token in ($input_ -split '[\s,]+' | Where-Object { $_ })) {
+            $index = 0
+            if ([int]::TryParse($token, [ref]$index)) {
+                if ($index -ge 1 -and $index -le $Provider.Count) {
+                    $name = $Provider[$index - 1].Name
+                    $selected[$name] = -not $selected[$name]
+                } else {
+                    Write-SpooferLog -Level Warn -Message "There is no module number $index."
+                }
+                continue
+            }
+
+            $match = @($Provider | Where-Object { $_.Name -eq $token.ToLowerInvariant() })
+            if ($match.Count -eq 1) {
+                $selected[$match[0].Name] = -not $selected[$match[0].Name]
+            } else {
+                Write-SpooferLog -Level Warn -Message "'$token' is not a module number or name."
+            }
+        }
+    }
+}
+
 function Get-SelectedProvider {
     <#
     .SYNOPSIS
-        Resolves the -Module / -Tier / -IncludeRisky combination to a provider list.
+        Resolves -Interactive / -Module / -Tier / -SafeOnly / -Exclude to a list.
+    .DESCRIPTION
+        With none of them given the answer is every module, Risky tier included.
     #>
+    param(
+        [switch]$AllowInteractive
+    )
+
+    $all = @(Get-SpooferProvider)
+
     if ($Module -and $Module.Count) {
-        return @(Get-SpooferProvider -Name $Module)
+        $chosen = @(Get-SpooferProvider -Name $Module)
+    } elseif ($Tier -and $Tier.Count) {
+        $chosen = @(Get-SpooferProvider -Tier $Tier)
+    } elseif ($SafeOnly) {
+        $chosen = @(Get-SpooferProvider -Tier @('Standard', 'Advanced'))
+    } else {
+        $chosen = $all
     }
 
-    if ($Tier -and $Tier.Count) {
-        return @(Get-SpooferProvider -Tier $Tier)
+    if ($Interactive -and $AllowInteractive) {
+        $chosen = Select-SpooferModuleInteractive -Provider $all -PreSelected @($chosen | ForEach-Object { $_.Name })
+        if ($null -eq $chosen) {
+            Write-SpooferLog -Level Info -Message 'Cancelled; nothing was changed.'
+            return @()
+        }
     }
 
-    $tiers = @('Standard', 'Advanced')
-    if ($IncludeRisky) { $tiers += 'Risky' }
-    return @(Get-SpooferProvider -Tier $tiers)
+    if ($Exclude -and $Exclude.Count) {
+        $unknown = @($Exclude | Where-Object { $name = $_; -not (@($all | Where-Object { $_.Name -eq $name })) })
+        if ($unknown.Count) {
+            throw ("Unknown module in -Exclude: {0}. Available modules: {1}" -f `
+                    ($unknown -join ', '), (($all | ForEach-Object { $_.Name }) -join ', '))
+        }
+        $chosen = @($chosen | Where-Object { $Exclude -notcontains $_.Name })
+    }
+
+    return @($chosen)
 }
 
 function New-RunContext {
     New-SpooferContext -DryRun:$DryRun -Force:$Force -Options @{
-        IncludeVirtualAdapters = [bool]$IncludeVirtualAdapters
-        AllowVolumeDismount    = [bool]$AllowVolumeDismount
+        IncludeVirtualAdapters  = [bool]$IncludeVirtualAdapters
+        IncludeRemovableVolumes = [bool]$IncludeRemovableVolumes
+        SkipDomainRename        = [bool]$SkipDomainRename
+        AllowVolumeDismount     = (-not $NoVolumeDismount)
     }
 }
 
@@ -244,9 +491,14 @@ function Invoke-StatusAction {
 
     if (-not (Test-SpooferAdmin)) {
         Write-SpooferLog -Level Warn -Message 'Not elevated. Values that need administrator rights to read will show as unavailable.'
+    } else {
+        Enable-SpooferPrivilegeSet | Out-Null
     }
 
-    foreach ($provider in (Get-SelectedProvider)) {
+    $providers = Get-SelectedProvider -AllowInteractive
+    if ($providers.Count -eq 0) { return }
+
+    foreach ($provider in $providers) {
         Write-SpooferBanner -Text ('{0}  [{1}]' -f $provider.Title, $provider.Tier)
 
         try {
@@ -278,22 +530,25 @@ function Invoke-StatusAction {
 function Invoke-SpoofAction {
     Test-Environment -RequireAdmin:(-not $DryRun)
 
-    $providers = Get-SelectedProvider
-    if ($providers.Count -eq 0) {
-        throw 'No modules selected.'
-    }
+    $providers = Get-SelectedProvider -AllowInteractive
+    if ($providers.Count -eq 0) { return }
 
     Initialize-SpooferRandom -Seed $Seed
 
     Write-Host ''
     Write-Host '  Modules selected:' -ForegroundColor White
     foreach ($provider in $providers) {
-        Write-Host ('    {0,-16} {1,-10} {2}' -f $provider.Name, $provider.Tier, $provider.Title) -ForegroundColor Gray
+        $colour = switch ($provider.Tier) { 'Risky' { 'Red' } 'Advanced' { 'Yellow' } default { 'Gray' } }
+        Write-Host ('    {0,-18}' -f $provider.Name) -ForegroundColor White -NoNewline
+        Write-Host ('{0,-10}' -f $provider.Tier) -ForegroundColor $colour -NoNewline
+        Write-Host $provider.Title -ForegroundColor DarkGray
     }
 
     $risky = @($providers | Where-Object { $_.Tier -eq 'Risky' })
     if ($risky.Count -and -not $DryRun) {
-        Write-SpooferLog -Level Warn -Message ('Risky-tier modules are included: {0}. Review them before continuing.' -f (($risky | ForEach-Object { $_.Name }) -join ', '))
+        Write-Host ''
+        Write-SpooferLog -Level Warn -Message ('Risky-tier modules are included: {0}.' -f (($risky | ForEach-Object { $_.Name }) -join ', '))
+        Write-SpooferLog -Level Warn -Message 'These can put Windows into an unactivated state and write raw disk sectors.'
     }
 
     if (-not $DryRun) {
@@ -308,10 +563,10 @@ function Invoke-SpoofAction {
         Write-SpooferLog -Level Info -Message "Backup session: $($session.Id)"
     }
 
-    $context   = New-RunContext
-    $changed   = 0
-    $skipped   = 0
-    $failed    = @()
+    $context = New-RunContext
+    $changed = 0
+    $skipped = 0
+    $failed  = @()
 
     foreach ($provider in $providers) {
         Write-SpooferBanner -Text ('{0}  [{1}]' -f $provider.Title, $provider.Tier)
@@ -329,8 +584,8 @@ function Invoke-SpoofAction {
         }
 
         foreach ($result in $results) {
-            if ($result.Changed)      { $changed++ }
-            elseif ($result.Skipped)  { $skipped++ }
+            if ($result.Changed)     { $changed++ }
+            elseif ($result.Skipped) { $skipped++ }
         }
 
         if ($session) { Save-SpooferBackupSession -Session $session | Out-Null }
@@ -344,7 +599,7 @@ function Invoke-SpoofAction {
     }
 
     Write-SpooferLog -Level Success -Message "$changed identifiers changed."
-    if ($skipped) { Write-SpooferLog -Level Info -Message "$skipped were skipped (not present on this system, or blocked)." }
+    if ($skipped) { Write-SpooferLog -Level Info -Message "$skipped were skipped (not present on this system, or the write was refused - see the messages above)." }
     if ($failed.Count) { Write-SpooferLog -Level Error -Message ('These modules failed: {0}' -f ($failed -join ', ')) }
 
     if ($session -and $session.Entries.Count) {
@@ -390,14 +645,14 @@ function Invoke-RestoreAction {
 
     Write-SpooferBanner -Text 'Summary'
     Write-SpooferLog -Level Success -Message "$($summary.Restored) of $($summary.Total) entries restored."
-    if ($summary.Skipped) { Write-SpooferLog -Level Info  -Message "$($summary.Skipped) skipped." }
+    if ($summary.Skipped) { Write-SpooferLog -Level Info -Message "$($summary.Skipped) skipped." }
 
     if ($summary.Failed) {
         Write-SpooferLog -Level Error -Message "$($summary.Failed) failed:"
         foreach ($failure in @($summary.Results | Where-Object { $_.Status -eq 'Failed' })) {
             Write-Host ('    {0}: {1}' -f $failure.Label, $failure.Message) -ForegroundColor Red
         }
-        Write-SpooferLog -Level Info -Message "The backup is still marked un-restored, so you can fix the cause and run the same command again."
+        Write-SpooferLog -Level Info -Message 'The backup is still marked un-restored, so you can fix the cause and run the same command again.'
     }
 
     if (-not $DryRun -and $summary.Restored -gt 0) {
@@ -456,8 +711,11 @@ function Invoke-RemoveAction {
 function Invoke-ModulesAction {
     Write-Host ''
     foreach ($provider in (Get-SpooferProvider)) {
+        $colour = switch ($provider.Tier) { 'Risky' { 'Red' } 'Advanced' { 'Yellow' } default { 'Gray' } }
+
         Write-Host ('  {0}' -f $provider.Name) -ForegroundColor White -NoNewline
-        Write-Host ('  [{0}]{1}' -f $provider.Tier, $(if ($provider.RequiresReboot) { ' [restart required]' } else { '' })) -ForegroundColor DarkGray
+        Write-Host ('  [{0}]' -f $provider.Tier) -ForegroundColor $colour -NoNewline
+        Write-Host $(if ($provider.RequiresReboot) { ' [restart required]' } else { '' }) -ForegroundColor DarkGray
 
         Write-Host ('      {0}' -f $provider.Description) -ForegroundColor Gray
         foreach ($target in @($provider.Targets)) {
@@ -466,8 +724,8 @@ function Invoke-ModulesAction {
         Write-Host ''
     }
 
-    Write-Host '  Default selection is the Standard and Advanced tiers.' -ForegroundColor DarkGray
-    Write-Host '  Add -IncludeRisky, or name a module directly, to reach the Risky tier.' -ForegroundColor DarkGray
+    Write-Host '  Every module runs by default. Narrow a run with -Interactive, -Module,' -ForegroundColor DarkGray
+    Write-Host '  -Exclude, -Tier, or -SafeOnly (which leaves out the Risky tier).' -ForegroundColor DarkGray
     Write-Host ''
 }
 
@@ -487,6 +745,18 @@ Show-Header
 if ($Action -in @('Status', 'Spoof')) { Show-Environment }
 
 Write-SpooferLog -Level Debug -NoConsole -Message ("Invoked: -Action {0} -Module '{1}' -DryRun:{2} -Force:{3}" -f $Action, ($Module -join ','), $DryRun, $Force)
+
+# Ask for elevation before doing anything, so the work happens in one place
+# rather than half here and half in an elevated child.
+if ((Test-SpooferActionNeedsAdmin -Name $Action) -and -not $DryRun -and
+    (Test-SpooferOnWindows) -and -not (Test-SpooferAdmin) -and -not $NoElevate) {
+
+    if (Invoke-SpooferRelaunchElevated -BoundParameters $PSBoundParameters) { return }
+
+    Write-Host ''
+    Write-SpooferLog -Level Error -Message "-Action $Action needs administrator rights. Re-run from an elevated PowerShell, or use Spoofer.cmd."
+    exit 1
+}
 
 try {
     switch ($Action) {

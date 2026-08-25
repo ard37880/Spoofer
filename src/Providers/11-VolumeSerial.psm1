@@ -2,16 +2,24 @@
 .SYNOPSIS
     Volume serial numbers, the XXXX-XXXX value "vol" prints.
 .DESCRIPTION
-    The serial lives in the volume boot record, so changing it means writing
-    that one sector back with four or eight bytes altered. The whole original
-    sector is saved to the backup session before anything is written, and a
-    restore puts that exact sector back.
+    The serial lives in the volume boot record, so changing it means writing that
+    record back with a few bytes altered. Every filesystem here is handled in
+    full rather than approximately:
 
-    The system volume is never touched: its boot record cannot be locked while
-    Windows is running on it. exFAT is skipped as well, because its boot region
-    carries a checksum over eleven sectors that a naive write would invalidate.
+      NTFS   64-bit serial at 0x48, mirrored into the backup boot sector that
+             sits in the last sector of the partition.
+      FAT32  32-bit serial at 0x43.
+      FAT16  32-bit serial at 0x27.
+      exFAT  32-bit serial at 0x64 in both the main and backup boot regions,
+             each of which is followed by a checksum over eleven sectors that
+             has to be recomputed or the volume stops mounting.
+
+    Every sector this provider touches is saved to the backup session first, so a
+    restore rewrites the exact bytes that were there.
 .NOTES
-    Risky tier - not selected unless you ask for it.
+    The system volume is attempted like any other. Windows will normally refuse
+    to lock the volume it is running from, in which case the failure is reported
+    with the offline procedure that does work.
 #>
 
 Set-StrictMode -Version Latest
@@ -19,6 +27,11 @@ Set-StrictMode -Version Latest
 Import-Module (Join-Path (Split-Path $PSScriptRoot -Parent) 'Common.psm1')      -DisableNameChecking
 Import-Module (Join-Path (Split-Path $PSScriptRoot -Parent) 'Native.psm1')      -DisableNameChecking
 Import-Module (Join-Path (Split-Path $PSScriptRoot -Parent) 'BackupStore.psm1') -DisableNameChecking
+
+# exFAT keeps twelve sectors of boot region, then an identical backup region.
+$script:ExFatRegionSectors = 12
+$script:ExFatChecksumSector = 11
+$script:ExFatBackupSector = 12
 
 function Get-SectorText {
     <#
@@ -41,32 +54,100 @@ function Get-VolumeSerialLayout {
     .SYNOPSIS
         Locates the serial number field inside a boot sector.
     .OUTPUTS
-        FileSystem, Offset and Length, or $null when the filesystem is one this
-        provider will not write to.
+        FileSystem, Offset, Length, and Region - how much of the volume has to be
+        read and written to change the serial safely.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][byte[]]$Sector
     )
 
-    if ((Get-SectorText -Sector $Sector -Offset 3 -Length 8) -eq 'NTFS    ') {
+    $oem = Get-SectorText -Sector $Sector -Offset 3 -Length 8
+
+    if ($oem -eq 'NTFS    ') {
         # NTFS keeps a 64-bit serial; Windows displays its low 32 bits.
-        return [pscustomobject]@{ FileSystem = 'NTFS'; Offset = 0x48; Length = 8 }
+        return [pscustomobject]@{ FileSystem = 'NTFS'; Offset = 0x48; Length = 8; Region = 'NtfsWithBackup' }
     }
 
-    if ((Get-SectorText -Sector $Sector -Offset 3 -Length 8) -eq 'EXFAT   ') {
-        return $null
+    if ($oem -eq 'EXFAT   ') {
+        return [pscustomobject]@{ FileSystem = 'exFAT'; Offset = 0x64; Length = 4; Region = 'ExFatBootRegion' }
     }
 
     if ((Get-SectorText -Sector $Sector -Offset 0x52 -Length 8) -eq 'FAT32   ') {
-        return [pscustomobject]@{ FileSystem = 'FAT32'; Offset = 0x43; Length = 4 }
+        return [pscustomobject]@{ FileSystem = 'FAT32'; Offset = 0x43; Length = 4; Region = 'SingleSector' }
     }
 
     if ((Get-SectorText -Sector $Sector -Offset 0x36 -Length 3) -eq 'FAT') {
-        return [pscustomobject]@{ FileSystem = (Get-SectorText -Sector $Sector -Offset 0x36 -Length 8).Trim(); Offset = 0x27; Length = 4 }
+        return [pscustomobject]@{
+            FileSystem = (Get-SectorText -Sector $Sector -Offset 0x36 -Length 8).Trim()
+            Offset     = 0x27
+            Length     = 4
+            Region     = 'SingleSector'
+        }
     }
 
     return $null
+}
+
+function Get-ExFatBootChecksum {
+    <#
+    .SYNOPSIS
+        The exFAT boot region checksum, over the first eleven sectors of a region.
+    .DESCRIPTION
+        Defined by the exFAT specification: a rotate-right-then-add over every
+        byte of sectors 0 to 10, skipping the three bytes that are expected to
+        change while the volume is mounted - VolumeFlags at 106 and 107, and
+        PercentInUse at 112. Sector 11 is then filled with the result repeated.
+    .PARAMETER Region
+        The region's bytes, starting at its main boot sector.
+    #>
+    [CmdletBinding()]
+    [OutputType([uint32])]
+    param(
+        [Parameter(Mandatory)][byte[]]$Region,
+        [Parameter(Mandatory)][int]$SectorSize
+    )
+
+    $count    = 11 * $SectorSize
+    $checksum = [uint64]0
+
+    for ($i = 0; $i -lt $count; $i++) {
+        if ($i -eq 106 -or $i -eq 107 -or $i -eq 112) { continue }
+
+        # The spec writes this as a rotate-right by one followed by an add. The
+        # arithmetic is done in 64 bits and masked back to 32 so the carry out of
+        # bit 31 is discarded rather than sign-extending a signed shift.
+        # 0x80000000 written as a hex literal is parsed as a negative Int32 and
+        # will not cast; the decimal form is unambiguous.
+        $carry    = if (($checksum -band 1) -ne 0) { [uint64]2147483648 } else { [uint64]0 }
+        $checksum = ($carry + ($checksum -shr 1) + [uint64]$Region[$i]) -band 0xFFFFFFFF
+    }
+
+    return [uint32]$checksum
+}
+
+function Set-ExFatBootChecksum {
+    <#
+    .SYNOPSIS
+        Recomputes a region's checksum and writes it across its checksum sector.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][byte[]]$Region,
+        [Parameter(Mandatory)][int]$SectorSize,
+        [int]$RegionOffset = 0
+    )
+
+    $slice = New-Object byte[] (11 * $SectorSize)
+    [System.Array]::Copy($Region, $RegionOffset, $slice, 0, $slice.Length)
+
+    $checksum = Get-ExFatBootChecksum -Region $slice -SectorSize $SectorSize
+    $bytes    = [System.BitConverter]::GetBytes($checksum)
+    $start    = $RegionOffset + ($script:ExFatChecksumSector * $SectorSize)
+
+    for ($offset = 0; $offset -lt $SectorSize; $offset += 4) {
+        [System.Array]::Copy($bytes, 0, $Region, $start + $offset, 4)
+    }
 }
 
 function Format-VolumeSerial {
@@ -83,6 +164,31 @@ function Format-VolumeSerial {
     if ($Sector.Length -lt ($Offset + 4)) { return '<unreadable>' }
     $hex = ([System.BitConverter]::ToUInt32($Sector, $Offset)).ToString('X8')
     return ('{0}-{1}' -f $hex.Substring(0, 4), $hex.Substring(4, 4))
+}
+
+function Get-NtfsBackupSectorOffset {
+    <#
+    .SYNOPSIS
+        Byte offset of the NTFS backup boot sector.
+    .DESCRIPTION
+        NTFS records its own sector count at 0x28, excluding the backup boot
+        sector that follows it. Deriving the offset from the volume itself is
+        safer than asking Windows for the partition size, which can include
+        alignment padding the filesystem does not use.
+    #>
+    [CmdletBinding()]
+    [OutputType([long])]
+    param(
+        [Parameter(Mandatory)][byte[]]$Sector,
+        [Parameter(Mandatory)][int]$SectorSize
+    )
+
+    if ($Sector.Length -lt 0x30) { return -1 }
+
+    $totalSectors = [System.BitConverter]::ToInt64($Sector, 0x28)
+    if ($totalSectors -le 0) { return -1 }
+
+    return ([long]$totalSectors * [long]$SectorSize)
 }
 
 function Get-SpooferVolumeSectorSize {
@@ -108,10 +214,12 @@ function Get-SpooferVolumeSectorSize {
 function Get-SpooferSpoofableVolume {
     <#
     .SYNOPSIS
-        Fixed, lettered volumes other than the one Windows is running from.
+        Every fixed, lettered volume, including the system volume.
     #>
     [CmdletBinding()]
-    param()
+    param(
+        [switch]$IncludeRemovable
+    )
 
     $systemLetter = ''
     if ($env:SystemDrive) { $systemLetter = $env:SystemDrive.TrimEnd(':').ToUpperInvariant() }
@@ -125,7 +233,7 @@ function Get-SpooferSpoofableVolume {
 
     foreach ($volume in $volumes) {
         if (-not $volume.DriveLetter) { continue }
-        if ($volume.DriveType -ne 'Fixed') { continue }
+        if ($volume.DriveType -ne 'Fixed' -and -not $IncludeRemovable) { continue }
 
         $letter = ([string]$volume.DriveLetter).ToUpperInvariant()
 
@@ -133,44 +241,146 @@ function Get-SpooferSpoofableVolume {
             DriveLetter = $letter
             Label       = [string]$volume.FileSystemLabel
             FileSystem  = [string]$volume.FileSystem
+            DriveType   = [string]$volume.DriveType
             IsSystem    = ($letter -eq $systemLetter)
             SectorSize  = (Get-SpooferVolumeSectorSize -DriveLetter $letter)
         }
     }
 }
 
-Register-SpooferRestoreHandler -Type 'VolumeSerial' -Handler {
-    param($Entry)
+function Get-VolumeSerialPlan {
+    <#
+    .SYNOPSIS
+        Works out every byte range that has to change for one volume, and what
+        the serial will read as afterwards.
+    .OUTPUTS
+        Layout, the current serial, and a list of writes as
+        { ByteOffset, Original, Updated }. Returns $null when the boot record is
+        not one this provider understands.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$DriveLetter,
+        [Parameter(Mandatory)][int]$SectorSize,
+        [byte[]]$NewSerialBytes
+    )
 
-    $sector = $null
+    $first  = Read-SpooferVolumeSector -DriveLetter $DriveLetter -ByteOffset 0 -Length $SectorSize -SectorSize $SectorSize
+    $layout = Get-VolumeSerialLayout -Sector $first
+    if ($null -eq $layout) { return $null }
 
-    if ($Entry.SectorFile) {
-        $path = Join-Path $Entry.SessionPath $Entry.SectorFile
-        if (Test-Path -LiteralPath $path) {
-            $sector = [System.IO.File]::ReadAllBytes($path)
+    if (-not $PSBoundParameters.ContainsKey('NewSerialBytes') -or $null -eq $NewSerialBytes) {
+        $NewSerialBytes = Get-SpooferRandomByte -Count $layout.Length
+    }
+
+    $writes  = New-Object System.Collections.ArrayList
+    $current = Format-VolumeSerial -Sector $first -Offset $layout.Offset
+    $updatedSerial = $current
+
+    switch ($layout.Region) {
+
+        'ExFatBootRegion' {
+            # Both boot regions are read as one run so their checksums can be
+            # recomputed from exactly the bytes that will be on disk.
+            $length   = 2 * $script:ExFatRegionSectors * $SectorSize
+            $original = Read-SpooferVolumeSector -DriveLetter $DriveLetter -ByteOffset 0 -Length $length -SectorSize $SectorSize
+
+            $updated = New-Object byte[] $original.Length
+            [System.Array]::Copy($original, $updated, $original.Length)
+
+            $backupBase = $script:ExFatBackupSector * $SectorSize
+            [System.Array]::Copy($NewSerialBytes, 0, $updated, $layout.Offset, $layout.Length)
+            [System.Array]::Copy($NewSerialBytes, 0, $updated, $backupBase + $layout.Offset, $layout.Length)
+
+            Set-ExFatBootChecksum -Region $updated -SectorSize $SectorSize -RegionOffset 0
+            Set-ExFatBootChecksum -Region $updated -SectorSize $SectorSize -RegionOffset $backupBase
+
+            $updatedSerial = Format-VolumeSerial -Sector $updated -Offset $layout.Offset
+            [void]$writes.Add([pscustomobject]@{ ByteOffset = [long]0; Original = $original; Updated = $updated })
+        }
+
+        'NtfsWithBackup' {
+            $updated = New-Object byte[] $first.Length
+            [System.Array]::Copy($first, $updated, $first.Length)
+            [System.Array]::Copy($NewSerialBytes, 0, $updated, $layout.Offset, $layout.Length)
+
+            $updatedSerial = Format-VolumeSerial -Sector $updated -Offset $layout.Offset
+            [void]$writes.Add([pscustomobject]@{ ByteOffset = [long]0; Original = $first; Updated = $updated })
+
+            # The backup boot sector carries the same serial. Windows only reads
+            # it when the primary is unreadable, but leaving the two out of step
+            # is exactly the kind of inconsistency chkdsk reports.
+            $backupOffset = Get-NtfsBackupSectorOffset -Sector $first -SectorSize $SectorSize
+            if ($backupOffset -gt 0) {
+                try {
+                    $backup = Read-SpooferVolumeSector -DriveLetter $DriveLetter -ByteOffset $backupOffset -Length $SectorSize -SectorSize $SectorSize
+                    if ((Get-SectorText -Sector $backup -Offset 3 -Length 8) -eq 'NTFS    ') {
+                        $backupUpdated = New-Object byte[] $backup.Length
+                        [System.Array]::Copy($backup, $backupUpdated, $backup.Length)
+                        [System.Array]::Copy($NewSerialBytes, 0, $backupUpdated, $layout.Offset, $layout.Length)
+                        [void]$writes.Add([pscustomobject]@{ ByteOffset = $backupOffset; Original = $backup; Updated = $backupUpdated })
+                    } else {
+                        Write-SpooferLog -Level Debug -Message "${DriveLetter}: backup boot sector does not carry an NTFS signature; leaving it alone."
+                    }
+                } catch {
+                    Write-SpooferLog -Level Debug -Message "${DriveLetter}: backup boot sector unreadable: $($_.Exception.Message)"
+                }
+            }
+        }
+
+        default {
+            $updated = New-Object byte[] $first.Length
+            [System.Array]::Copy($first, $updated, $first.Length)
+            [System.Array]::Copy($NewSerialBytes, 0, $updated, $layout.Offset, $layout.Length)
+
+            $updatedSerial = Format-VolumeSerial -Sector $updated -Offset $layout.Offset
+            [void]$writes.Add([pscustomobject]@{ ByteOffset = [long]0; Original = $first; Updated = $updated })
         }
     }
 
-    if ($null -eq $sector -and $Entry.SectorBase64) {
-        $sector = [System.Convert]::FromBase64String([string]$Entry.SectorBase64)
+    return [pscustomobject]@{
+        Layout    = $layout
+        OldSerial = $current
+        NewSerial = $updatedSerial
+        Writes    = @($writes)
     }
+}
 
-    if ($null -eq $sector) {
-        throw "The saved boot sector for $($Entry.DriveLetter): is missing from the backup."
-    }
+Register-SpooferRestoreHandler -Type 'VolumeSerial' -Handler {
+    param($Entry)
 
-    # Refuse to write a sector from one filesystem over another: a reformat or a
+    # Refuse to write one filesystem's boot record over another: a reformat or a
     # drive-letter reassignment since the backup would otherwise destroy the volume.
-    $current = Read-SpooferBootSector -DriveLetter $Entry.DriveLetter -SectorSize $sector.Length
+    $current = Read-SpooferVolumeSector -DriveLetter $Entry.DriveLetter -ByteOffset 0 `
+        -Length $Entry.SectorSize -SectorSize $Entry.SectorSize
     $layout  = Get-VolumeSerialLayout -Sector $current
 
     if ($null -eq $layout -or $layout.FileSystem -ne $Entry.FileSystem) {
         $now = if ($layout) { $layout.FileSystem } else { 'an unrecognised filesystem' }
-        throw ("$($Entry.DriveLetter): now holds {0}, not the {1} volume that was backed up. Refusing to overwrite its boot sector." -f $now, $Entry.FileSystem)
+        throw ("$($Entry.DriveLetter): now holds {0}, not the {1} volume that was backed up. Refusing to overwrite its boot record." -f $now, $Entry.FileSystem)
     }
 
-    Write-SpooferBootSector -DriveLetter $Entry.DriveLetter -Sector $sector -AllowDismount
-    return "Boot sector of $($Entry.DriveLetter): restored ($($Entry.FileSystem))."
+    $restored = 0
+    foreach ($write in @($Entry.Writes)) {
+        $bytes = $null
+
+        if ($write.File) {
+            $path = Join-Path $Entry.SessionPath $write.File
+            if (Test-Path -LiteralPath $path) { $bytes = [System.IO.File]::ReadAllBytes($path) }
+        }
+        if ($null -eq $bytes -and $write.Base64) {
+            $bytes = [System.Convert]::FromBase64String([string]$write.Base64)
+        }
+        if ($null -eq $bytes) {
+            throw "The saved sectors at offset $($write.ByteOffset) for $($Entry.DriveLetter): are missing from the backup."
+        }
+
+        Write-SpooferVolumeSector -DriveLetter $Entry.DriveLetter -ByteOffset ([long]$write.ByteOffset) `
+            -Data $bytes -SectorSize $Entry.SectorSize -AllowDismount
+        $restored++
+    }
+
+    return "Boot record of $($Entry.DriveLetter): restored ($($Entry.FileSystem), $restored write(s))."
 }
 
 function Get-SpooferProviderDefinition {
@@ -179,13 +389,13 @@ function Get-SpooferProviderDefinition {
         Title          = 'Volume serial numbers'
         Tier           = 'Risky'
         RequiresReboot = $false
-        Description    = 'Rewrites the serial number in each fixed volume''s boot record. The system volume and exFAT volumes are always skipped. The complete original sector is saved before any write.'
-        Targets        = @('Volume boot record of every fixed, lettered, non-system volume')
+        Description    = 'Rewrites the serial number in every fixed volume''s boot record, including NTFS backup boot sectors and both exFAT boot regions with their checksums recomputed. Every sector touched is saved before any write.'
+        Targets        = @('Volume boot record of every fixed, lettered volume, the system volume included')
 
         GetState = {
             param($Context)
 
-            $volumes = @(Get-SpooferSpoofableVolume)
+            $volumes = @(Get-SpooferSpoofableVolume -IncludeRemovable:([bool](Get-SpooferOption -Context $Context -Name 'IncludeRemovableVolumes' -Default $false)))
             if ($volumes.Count -eq 0) {
                 return @([pscustomobject]@{ Item = 'Volumes'; Value = 'none found'; Note = '' })
             }
@@ -193,18 +403,17 @@ function Get-SpooferProviderDefinition {
             foreach ($volume in $volumes) {
                 $item = '{0}: [{1}]' -f $volume.DriveLetter, $(if ($volume.Label) { $volume.Label } else { $volume.FileSystem })
 
-                if ($volume.IsSystem) {
-                    [pscustomobject]@{ Item = $item; Value = '<not read>'; Note = 'system volume - always skipped' }
-                    continue
-                }
-
                 try {
-                    $sector = Read-SpooferBootSector -DriveLetter $volume.DriveLetter -SectorSize $volume.SectorSize
+                    $sector = Read-SpooferVolumeSector -DriveLetter $volume.DriveLetter -ByteOffset 0 `
+                        -Length $volume.SectorSize -SectorSize $volume.SectorSize
                     $layout = Get-VolumeSerialLayout -Sector $sector
+
                     if ($null -eq $layout) {
-                        [pscustomobject]@{ Item = $item; Value = '<unsupported>'; Note = "$($volume.FileSystem) boot records are not written by this tool" }
+                        [pscustomobject]@{ Item = $item; Value = '<unrecognised>'; Note = "$($volume.FileSystem) boot record not understood" }
                     } else {
-                        [pscustomobject]@{ Item = $item; Value = (Format-VolumeSerial -Sector $sector -Offset $layout.Offset); Note = $layout.FileSystem }
+                        $note = $layout.FileSystem
+                        if ($volume.IsSystem) { $note += ', system volume' }
+                        [pscustomobject]@{ Item = $item; Value = (Format-VolumeSerial -Sector $sector -Offset $layout.Offset); Note = $note }
                     }
                 } catch {
                     [pscustomobject]@{ Item = $item; Value = '<unreadable>'; Note = $_.Exception.Message }
@@ -215,77 +424,98 @@ function Get-SpooferProviderDefinition {
         Invoke = {
             param($Session, $Context)
 
-            $volumes = @(Get-SpooferSpoofableVolume | Where-Object { -not $_.IsSystem })
+            $volumes = @(Get-SpooferSpoofableVolume -IncludeRemovable:([bool](Get-SpooferOption -Context $Context -Name 'IncludeRemovableVolumes' -Default $false)))
             if ($volumes.Count -eq 0) {
-                Write-SpooferLog -Level Warn -Message 'No eligible volumes found. The system volume is always skipped.'
+                Write-SpooferLog -Level Warn -Message 'No lettered volumes found.'
                 return @()
             }
 
-            $allowDismount = [bool](Get-SpooferOption -Context $Context -Name 'AllowVolumeDismount' -Default $false)
+            # Dismounting is the default here: without it the write fails on any
+            # volume with an open handle, which in practice is most of them.
+            $allowDismount = [bool](Get-SpooferOption -Context $Context -Name 'AllowVolumeDismount' -Default $true)
             $results = New-Object System.Collections.ArrayList
 
             foreach ($volume in $volumes) {
                 $label = 'Volume {0}: serial' -f $volume.DriveLetter
 
                 try {
-                    $sector = Read-SpooferBootSector -DriveLetter $volume.DriveLetter -SectorSize $volume.SectorSize
+                    $plan = Get-VolumeSerialPlan -DriveLetter $volume.DriveLetter -SectorSize $volume.SectorSize
                 } catch {
-                    Write-SpooferLog -Level Warn -Message "Skipping $($volume.DriveLetter): $($_.Exception.Message)"
+                    Write-SpooferLog -Level Error -Message "$($volume.DriveLetter): could not read the boot record: $($_.Exception.Message)"
+                    [void]$results.Add([pscustomobject]@{
+                        Label = $label; OldValue = $null; NewValue = $null
+                        Changed = $false; Simulated = $false; Skipped = $true; Reason = $_.Exception.Message
+                    })
                     continue
                 }
 
-                $layout = Get-VolumeSerialLayout -Sector $sector
-                if ($null -eq $layout) {
-                    Write-SpooferLog -Level Warn -Message "Skipping $($volume.DriveLetter): $($volume.FileSystem) boot records are not written by this tool."
+                if ($null -eq $plan) {
+                    Write-SpooferLog -Level Warn -Message "$($volume.DriveLetter): boot record is not one this provider understands ($($volume.FileSystem)); leaving it untouched."
+                    [void]$results.Add([pscustomobject]@{
+                        Label = $label; OldValue = $null; NewValue = $null
+                        Changed = $false; Simulated = $false; Skipped = $true; Reason = 'Unrecognised boot record'
+                    })
                     continue
                 }
-
-                $oldSerial = Format-VolumeSerial -Sector $sector -Offset $layout.Offset
-
-                $updated = [byte[]]::new($sector.Length)
-                [System.Array]::Copy($sector, $updated, $sector.Length)
-                $newBytes = Get-SpooferRandomByte -Count $layout.Length
-                [System.Array]::Copy($newBytes, 0, $updated, $layout.Offset, $layout.Length)
-
-                $newSerial = Format-VolumeSerial -Sector $updated -Offset $layout.Offset
 
                 if ($Context.DryRun) {
-                    Write-SpooferChange -Label $label -OldValue $oldSerial -NewValue $newSerial -Simulated
+                    Write-SpooferChange -Label $label -OldValue $plan.OldSerial -NewValue $plan.NewSerial -Simulated
                     [void]$results.Add([pscustomobject]@{
-                        Label = $label; OldValue = $oldSerial; NewValue = $newSerial
+                        Label = $label; OldValue = $plan.OldSerial; NewValue = $plan.NewSerial
                         Changed = $false; Simulated = $true; Skipped = $false; Reason = ''
                     })
                     continue
                 }
 
                 if ($Session) {
-                    $fileName = 'volume-{0}-boot.bin' -f $volume.DriveLetter
-                    $filePath = New-SpooferBackupFilePath -Session $Session -Name $fileName
-                    [System.IO.File]::WriteAllBytes($filePath, $sector)
+                    $writeRecords = New-Object System.Collections.ArrayList
+                    $index = 0
+
+                    foreach ($write in $plan.Writes) {
+                        $fileName = 'volume-{0}-{1}.bin' -f $volume.DriveLetter, $index
+                        $filePath = New-SpooferBackupFilePath -Session $Session -Name $fileName
+                        [System.IO.File]::WriteAllBytes($filePath, $write.Original)
+
+                        [void]$writeRecords.Add([ordered]@{
+                            ByteOffset = [long]$write.ByteOffset
+                            File       = ('files\{0}' -f $fileName)
+                            Base64     = [System.Convert]::ToBase64String($write.Original)
+                        })
+                        $index++
+                    }
 
                     Add-SpooferBackupEntry -Session $Session -Type 'VolumeSerial' -Module 'volumeserial' -Label $label -Data @{
-                        DriveLetter  = $volume.DriveLetter
-                        FileSystem   = $layout.FileSystem
-                        SectorSize   = $sector.Length
-                        SectorFile   = ('files\{0}' -f $fileName)
-                        SessionPath  = $Session.Path
-                        SectorBase64 = [System.Convert]::ToBase64String($sector)
-                        Serial       = $oldSerial
+                        DriveLetter = $volume.DriveLetter
+                        FileSystem  = $plan.Layout.FileSystem
+                        SectorSize  = $volume.SectorSize
+                        SessionPath = $Session.Path
+                        Serial      = $plan.OldSerial
+                        Writes      = @($writeRecords)
                     } | Out-Null
                 }
 
                 try {
-                    Write-SpooferBootSector -DriveLetter $volume.DriveLetter -Sector $updated -AllowDismount:$allowDismount
-                    Write-SpooferChange -Label $label -OldValue $oldSerial -NewValue $newSerial
+                    foreach ($write in $plan.Writes) {
+                        Write-SpooferVolumeSector -DriveLetter $volume.DriveLetter -ByteOffset $write.ByteOffset `
+                            -Data $write.Updated -SectorSize $volume.SectorSize -AllowDismount:$allowDismount
+                    }
+
+                    Write-SpooferChange -Label $label -OldValue $plan.OldSerial -NewValue $plan.NewSerial
                     [void]$results.Add([pscustomobject]@{
-                        Label = $label; OldValue = $oldSerial; NewValue = $newSerial
+                        Label = $label; OldValue = $plan.OldSerial; NewValue = $plan.NewSerial
                         Changed = $true; Simulated = $false; Skipped = $false; Reason = ''
                     })
                 } catch {
                     Write-SpooferLog -Level Error -Message "$($volume.DriveLetter): $($_.Exception.Message)"
-                    Write-SpooferLog -Level Info  -Message "Close anything using $($volume.DriveLetter): and retry, or pass -AllowVolumeDismount to dismount it first."
+
+                    if ($volume.IsSystem) {
+                        Write-SpooferLog -Level Info -Message "Windows will not let the volume it is running from be locked. Boot from Windows PE or another installation, where $($volume.DriveLetter): is not the system volume, and run the same command there."
+                    } else {
+                        Write-SpooferLog -Level Info -Message "Close anything holding $($volume.DriveLetter): open and retry."
+                    }
+
                     [void]$results.Add([pscustomobject]@{
-                        Label = $label; OldValue = $oldSerial; NewValue = $newSerial
+                        Label = $label; OldValue = $plan.OldSerial; NewValue = $plan.NewSerial
                         Changed = $false; Simulated = $false; Skipped = $true; Reason = $_.Exception.Message
                     })
                 }

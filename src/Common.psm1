@@ -336,7 +336,7 @@ function Get-SpooferRandomByte {
     [OutputType([byte[]])]
     param(
         [Parameter(Mandatory)]
-        [ValidateRange(1, 4096)]
+        [ValidateRange(1, 1048576)]
         [int]$Count
     )
 
@@ -525,6 +525,72 @@ function New-SpooferVolumeSerial {
 
 #endregion
 
+#region Processes
+
+function Invoke-SpooferProcess {
+    <#
+    .SYNOPSIS
+        Runs a console tool and returns its exit code together with its output.
+    .DESCRIPTION
+        Used for the Windows tools that have no managed equivalent - bcdedit and
+        bcdboot. Output is captured rather than printed so a failure can be
+        reported in context instead of scrolling past.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$FilePath,
+
+        [string[]]$ArgumentList = @(),
+
+        [int]$TimeoutSeconds = 120
+    )
+
+    $info = New-Object System.Diagnostics.ProcessStartInfo
+    $info.FileName               = $FilePath
+    $info.Arguments              = ($ArgumentList -join ' ')
+    $info.UseShellExecute        = $false
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError  = $true
+    $info.CreateNoWindow         = $true
+
+    Write-SpooferLog -Level Debug -Message ("Running: {0} {1}" -f $FilePath, $info.Arguments)
+
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $info
+
+    try {
+        [void]$process.Start()
+
+        # Read both streams before waiting: a tool that fills a redirected pipe
+        # blocks forever if nothing is draining it.
+        $stdout = $process.StandardOutput.ReadToEnd()
+        $stderr = $process.StandardError.ReadToEnd()
+
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            try { $process.Kill() } catch { }
+            throw "$FilePath did not finish within $TimeoutSeconds seconds."
+        }
+
+        $result = [pscustomobject]@{
+            ExitCode = $process.ExitCode
+            Output   = $stdout
+            Error    = $stderr
+            Success  = ($process.ExitCode -eq 0)
+        }
+    } finally {
+        $process.Dispose()
+    }
+
+    if (-not $result.Success) {
+        Write-SpooferLog -Level Debug -Message ("{0} exited {1}: {2}" -f $FilePath, $result.ExitCode, ($result.Error + $result.Output).Trim())
+    }
+
+    return $result
+}
+
+#endregion
+
 #region Provider context
 
 function New-SpooferContext {
@@ -657,6 +723,7 @@ Export-ModuleMember -Function @(
     'New-SpooferMacAddress'
     'New-SpooferComputerName'
     'New-SpooferVolumeSerial'
+    'Invoke-SpooferProcess'
     'New-SpooferContext'
     'Get-SpooferOption'
     'ConvertTo-SpooferDisplayValue'

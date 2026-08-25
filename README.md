@@ -11,15 +11,24 @@ replays that session to return the machine to exactly the state it was in.
 ```powershell
 .\Spoofer.ps1 -Action Status                     # what the identifiers are now
 .\Spoofer.ps1 -Action Spoof -DryRun              # what would change
-.\Spoofer.ps1 -Action Spoof                      # change them
+.\Spoofer.ps1 -Action Spoof                      # change everything
+.\Spoofer.ps1 -Action Spoof -Interactive         # tick what to change
 .\Spoofer.ps1 -Action Restore -BackupId latest   # change them back
 ```
+
+Every module runs by default, the ones that can disturb licensing or the boot
+configuration included. `-Interactive` gives you a checklist instead.
 
 ## Requirements
 
 - Windows 10 or 11 (build 10240 or later)
 - Windows PowerShell 5.1, which ships with both, or PowerShell 7+
-- An elevated **64-bit** shell for `Spoof` and `Restore`
+- A **64-bit** shell for `Spoof` and `Restore`
+
+Those two actions need administrator rights, and the script asks Windows for
+them itself: run it from an ordinary prompt and it reopens elevated after the
+UAC prompt. `-NoElevate` turns that off for unattended runs that are already
+elevated.
 
 A 32-bit PowerShell on 64-bit Windows is refused rather than run: registry writes
 would be redirected into `WOW6432Node` and would silently miss the real values.
@@ -35,17 +44,39 @@ cd Spoofer
 
 # Show every change that would be made, and write nothing.
 .\Spoofer.ps1 -Action Spoof -DryRun
-```
 
-Then, from an elevated prompt:
+# Pick from a checklist, then run.
+.\Spoofer.ps1 -Action Spoof -Interactive
 
-```powershell
+# Or change everything.
 .\Spoofer.ps1 -Action Spoof
 ```
 
-`Spoofer.cmd` does the elevation for you if you would rather double-click; it
-forwards its arguments to the script and bypasses the execution policy for that
-one process only.
+`Spoofer.cmd` is there if you would rather double-click; it forwards its
+arguments and bypasses the execution policy for that one process only.
+
+### Choosing what to change
+
+`-Interactive` prints a checklist you can toggle before anything happens:
+
+```
+   #      Module            Tier      What it is
+   1. [x] machineguid       Standard  Cryptography MachineGuid
+   2. [x] machineid         Standard  Secondary machine identifiers
+   ...
+  12. [x] digitalproductid  Risky     Digital product id
+  13. [x] edid              Advanced  Monitor EDID serials
+
+   13 of 13 selected
+
+   Toggle : numbers or names, e.g. "1 4 7" or "mac volumeserial"
+   a all   n none   s standard   d advanced   r risky   i invert
+   Enter to run the ticked modules, q to cancel
+```
+
+The same choices are available non-interactively: `-Module` to name them,
+`-Exclude` to drop some, `-Tier` to pick a tier, and `-SafeOnly` for everything
+except the Risky tier.
 
 ## What it changes
 
@@ -61,27 +92,33 @@ Run `.\Spoofer.ps1 -Action Modules` for the current list with full detail.
 | `smbios` | Advanced | Cached SMBIOS strings: manufacturer, model, family, SKU, BIOS vendor/version/date |
 | `computername` | Advanced | Hostname, in all four places Windows keeps it (needs a restart) |
 | `mac` | Advanced | A locally administered MAC address on each physical adapter |
-| `diskid` | Advanced | GPT disk GUID, or the MBR signature on non-boot disks |
+| `diskid` | Advanced | GPT disk GUID, or the MBR signature - boot disks included, with the boot configuration rewritten to match |
+| `edid` | Advanced | The serial in each cached monitor EDID, checksum recomputed |
 | `productid` | Risky | The Windows `ProductId` string |
-| `volumeserial` | Risky | The `XXXX-XXXX` serial in each non-system volume's boot record |
+| `digitalproductid` | Risky | The `DigitalProductId` blobs - the binary form of the installed product key |
+| `volumeserial` | Risky | The `XXXX-XXXX` serial in every volume's boot record, NTFS backup sectors and exFAT checksums included |
 
 Tiers describe blast radius, not effectiveness:
 
 - **Standard** - reversible registry values, no restart, nothing else depends on them.
 - **Advanced** - touches devices or the partition table, or needs a restart.
-- **Risky** - can disturb software licensing or, for `volumeserial`, writes a raw
-  disk sector. Not selected unless you ask: `-IncludeRisky`, or name the module.
+- **Risky** - can disturb software licensing or activation, or writes raw disk
+  sectors.
 
-By default `Spoof` runs the Standard and Advanced tiers.
+All three run by default. `-SafeOnly` leaves out the Risky tier; `-Interactive`
+lets you tick individual modules.
 
 ## Usage
 
 ```
 .\Spoofer.ps1 [-Action <Status|Spoof|Restore|List|Remove|Modules>]
-              [-Module <names>] [-Tier <Standard|Advanced|Risky>] [-IncludeRisky]
+              [-Interactive]
+              [-Module <names>] [-Exclude <names>]
+              [-Tier <Standard|Advanced|Risky>] [-SafeOnly]
               [-Seed <int>] [-BackupId <id|latest>] [-Note <text>]
-              [-DryRun] [-Force] [-Yes]
-              [-IncludeVirtualAdapters] [-AllowVolumeDismount]
+              [-DryRun] [-Force] [-Yes] [-NoElevate]
+              [-IncludeVirtualAdapters] [-IncludeRemovableVolumes]
+              [-SkipDomainRename] [-NoVolumeDismount]
               [-NoRestartPrompt] [-LogLevel <Debug|Info|Warn|Error>]
 ```
 
@@ -99,11 +136,17 @@ By default `Spoof` runs the Standard and Advanced tiers.
 ### Examples
 
 ```powershell
+# Tick what to change from a checklist.
+.\Spoofer.ps1 -Action Spoof -Interactive
+
 # Just the machine IDs and the MAC addresses.
 .\Spoofer.ps1 -Action Spoof -Module machineguid,machineid,mac
 
-# Everything, including the risky tier, without prompting.
-.\Spoofer.ps1 -Action Spoof -IncludeRisky -Yes
+# Everything except the two that touch activation.
+.\Spoofer.ps1 -Action Spoof -Exclude productid,digitalproductid
+
+# Everything except the Risky tier, without prompting.
+.\Spoofer.ps1 -Action Spoof -SafeOnly -Yes
 
 # Reproducible identity: the same seed always generates the same values.
 .\Spoofer.ps1 -Action Spoof -Seed 20260825 -Note 'test rig profile A'
@@ -155,6 +198,17 @@ value stayed changed.
 
 In short: this changes what Windows *reports*. It does not reflash firmware, and
 it does not touch anything a kernel driver reads directly from hardware.
+
+Two things are worth knowing before a full run:
+
+- **The MBR boot disk.** Its signature is referenced by the boot configuration.
+  `diskid` exports the boot store, changes the signature, and rewrites the boot
+  entries with `bcdboot`; if any of that fails, the signature goes straight back
+  and the store is re-imported. A restart is still the only real proof.
+- **The system volume's serial.** Windows will not let the volume it is running
+  from be locked, so the write is attempted and reported honestly rather than
+  skipped silently. Boot from Windows PE and run the same command there and it
+  works, because `C:` is not the system volume in that environment.
 
 ## Development
 
