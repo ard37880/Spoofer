@@ -570,9 +570,34 @@ Describe-Group 'Boot record parsing' {
         Assert-Equal 0x27 $layout.Offset
     }
 
-    Test-Case 'exFAT is refused rather than written to blindly' {
+    Test-Case 'exFAT boot records are recognised at offset 0x64' {
         $sector = New-FakeSector -Signature 'EXFAT   ' -SignatureOffset 3 -SerialOffset 0x64
-        Assert-Equal $null (& $volumeModule { param($s) Get-VolumeSerialLayout -Sector $s } $sector)
+        $layout = & $volumeModule { param($s) Get-VolumeSerialLayout -Sector $s } $sector
+
+        Assert-Equal 'exFAT' $layout.FileSystem
+        Assert-Equal 0x64 $layout.Offset
+        Assert-Equal 4 $layout.Length
+        Assert-Equal 'ExFatBootRegion' $layout.Region 'exFAT needs the whole boot region rewritten, not one sector'
+    }
+
+    Test-Case 'Each filesystem declares how much has to be rewritten' {
+        $ntfs = & $volumeModule { param($s) Get-VolumeSerialLayout -Sector $s } (New-FakeSector -Signature 'NTFS    ' -SignatureOffset 3 -SerialOffset 0x48)
+        Assert-Equal 'NtfsWithBackup' $ntfs.Region 'NTFS mirrors its serial into the backup boot sector'
+
+        $fat = & $volumeModule { param($s) Get-VolumeSerialLayout -Sector $s } (New-FakeSector -Signature 'FAT32   ' -SignatureOffset 0x52 -SerialOffset 0x43)
+        Assert-Equal 'SingleSector' $fat.Region
+    }
+
+    Test-Case 'The NTFS backup boot sector is located from the volume itself' {
+        $sector = New-FakeSector -Signature 'NTFS    ' -SignatureOffset 3 -SerialOffset 0x48
+        [System.Array]::Copy([System.BitConverter]::GetBytes([int64]2048), 0, $sector, 0x28, 8)
+
+        $offset = & $volumeModule { param($s) Get-NtfsBackupSectorOffset -Sector $s -SectorSize 512 } $sector
+        Assert-Equal (2048 * 512) $offset
+
+        # A zeroed sector count means "do not guess", not "offset zero".
+        $blank = New-FakeSector -Signature 'NTFS    ' -SignatureOffset 3 -SerialOffset 0x48
+        Assert-Equal -1 (& $volumeModule { param($s) Get-NtfsBackupSectorOffset -Sector $s -SectorSize 512 } $blank)
     }
 
     Test-Case 'An unrecognised boot record yields no layout' {
@@ -588,6 +613,351 @@ Describe-Group 'Boot record parsing' {
     Test-Case 'A truncated sector is reported, not misread' {
         $text = & $volumeModule { param($s) Format-VolumeSerial -Sector $s -Offset 0x48 } ([byte[]]::new(16))
         Assert-Equal '<unreadable>' $text
+    }
+}
+
+Describe-Group 'Module selection checklist' {
+
+    # The picker lives in Spoofer.ps1, so its functions are lifted out of the
+    # script's syntax tree and defined here. Running the script itself would
+    # execute the whole command line instead.
+    $scriptText = Get-Content -LiteralPath (Join-Path $root 'Spoofer.ps1') -Raw
+    $scriptAst  = [System.Management.Automation.Language.Parser]::ParseInput($scriptText, [ref]$null, [ref]$null)
+
+    foreach ($definition in $scriptAst.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false)) {
+        if ($definition.Name -in @('Show-ModuleChecklist', 'Select-SpooferModuleInteractive')) {
+            . ([scriptblock]::Create($definition.Extent.Text))
+        }
+    }
+
+    $catalogue    = @(Get-SpooferProvider)
+    $script:Keys  = @()
+    $script:KeyAt = 0
+
+    # Stands in for the console prompt. Defined in this scope, so it shadows the
+    # real cmdlet for the picker and disappears with the group.
+    function Read-Host {
+        param([string]$Prompt)
+        $value = $script:Keys[$script:KeyAt]
+        $script:KeyAt++
+        return $value
+    }
+
+    function Invoke-Picker {
+        param([string[]]$Keystrokes, [string[]]$PreSelected)
+
+        $script:Keys  = $Keystrokes
+        $script:KeyAt = 0
+
+        $chosen = Select-SpooferModuleInteractive -Provider $catalogue -PreSelected $PreSelected 6>$null
+        if ($null -eq $chosen) { return '<cancelled>' }
+        return ((@($chosen) | ForEach-Object { $_.Name }) -join ',')
+    }
+
+    function Get-TierNames {
+        param([string]$Tier)
+        return ((@($catalogue | Where-Object { $_.Tier -eq $Tier }) | ForEach-Object { $_.Name }) -join ',')
+    }
+
+    $everything = ((@($catalogue) | ForEach-Object { $_.Name }) -join ',')
+
+    Test-Case 'Pressing enter accepts what is already ticked' {
+        Assert-Equal $everything (Invoke-Picker -Keystrokes @('') -PreSelected $null)
+    }
+
+    Test-Case 'A pre-selection is what starts ticked' {
+        Assert-Equal 'machineguid,mac' (Invoke-Picker -Keystrokes @('') -PreSelected @('machineguid', 'mac'))
+    }
+
+    Test-Case 'q cancels without selecting anything' {
+        Assert-Equal '<cancelled>' (Invoke-Picker -Keystrokes @('q') -PreSelected $null)
+    }
+
+    Test-Case 'Entries toggle by number' {
+        Assert-Equal 'machineguid,hwprofile' (Invoke-Picker -Keystrokes @('n', '1 3', '') -PreSelected $null)
+    }
+
+    Test-Case 'Entries toggle by name' {
+        Assert-Equal 'mac,volumeserial' (Invoke-Picker -Keystrokes @('n', 'mac volumeserial', '') -PreSelected $null)
+    }
+
+    Test-Case 'Numbers may be separated by commas' {
+        Assert-Equal 'machineguid,machineid' (Invoke-Picker -Keystrokes @('n', '1,2', '') -PreSelected $null)
+    }
+
+    Test-Case 'Toggling twice returns an entry to where it started' {
+        Assert-Equal $everything (Invoke-Picker -Keystrokes @('mac', 'mac', '') -PreSelected $null)
+    }
+
+    Test-Case 'The tier shortcuts select exactly that tier' {
+        Assert-Equal (Get-TierNames -Tier 'Risky')    (Invoke-Picker -Keystrokes @('r', '') -PreSelected $null)
+        Assert-Equal (Get-TierNames -Tier 'Standard') (Invoke-Picker -Keystrokes @('s', '') -PreSelected $null)
+        Assert-Equal (Get-TierNames -Tier 'Advanced') (Invoke-Picker -Keystrokes @('d', '') -PreSelected $null)
+    }
+
+    Test-Case 'a ticks everything and n clears it' {
+        Assert-Equal $everything (Invoke-Picker -Keystrokes @('n', 'a', '') -PreSelected @('mac'))
+    }
+
+    Test-Case 'i inverts the current selection' {
+        Assert-Equal $everything (Invoke-Picker -Keystrokes @('n', 'i', '') -PreSelected $null)
+
+        $withoutFirst = ((@($catalogue | Where-Object { $_.Name -ne 'machineguid' }) | ForEach-Object { $_.Name }) -join ',')
+        Assert-Equal $withoutFirst (Invoke-Picker -Keystrokes @('n', 'machineguid', 'i', '') -PreSelected $null)
+    }
+
+    Test-Case 'An empty selection re-prompts rather than running nothing' {
+        Assert-Equal 'machineguid' (Invoke-Picker -Keystrokes @('n', '', '1', '') -PreSelected $null)
+    }
+
+    Test-Case 'Unknown names and out-of-range numbers are rejected, not obeyed' {
+        Assert-Equal 'machineguid' (Invoke-Picker -Keystrokes @('n', 'nosuchmodule', '999', '0', '1', '') -PreSelected $null)
+    }
+
+    Test-Case 'Selection order follows the catalogue, not the order typed' {
+        Assert-Equal 'machineguid,mac' (Invoke-Picker -Keystrokes @('n', 'mac machineguid', '') -PreSelected $null)
+    }
+}
+
+Describe-Group 'exFAT boot region' {
+
+    $exfatModule = Import-Module (Join-Path $sourceDir 'Providers/11-VolumeSerial.psm1') -Force -PassThru -DisableNameChecking
+
+    function Get-ReferenceExFatChecksum {
+        # The specification formula, evaluated in arbitrary precision so it can
+        # disagree with the module if the module's 32-bit arithmetic is wrong.
+        param([byte[]]$Region, [int]$SectorSize)
+
+        $modulus = [System.Numerics.BigInteger]::Pow(2, 32)
+        $value   = [System.Numerics.BigInteger]0
+
+        for ($i = 0; $i -lt 11 * $SectorSize; $i++) {
+            if ($i -eq 106 -or $i -eq 107 -or $i -eq 112) { continue }
+            $high  = if (($value % 2) -eq 1) { [System.Numerics.BigInteger]2147483648 } else { [System.Numerics.BigInteger]0 }
+            $value = ($high + [System.Numerics.BigInteger]::Divide($value, 2) + $Region[$i]) % $modulus
+        }
+        return [uint32]$value
+    }
+
+    Test-Case 'The checksum matches an independent implementation' {
+        foreach ($sectorSize in @(512, 4096)) {
+            Initialize-SpooferRandom -Seed $sectorSize
+            $region = Get-SpooferRandomByte -Count (12 * $sectorSize)
+
+            $actual   = & $exfatModule { param($r, $s) Get-ExFatBootChecksum -Region $r -SectorSize $s } $region $sectorSize
+            $expected = Get-ReferenceExFatChecksum -Region $region -SectorSize $sectorSize
+
+            Assert-Equal $expected $actual "sector size $sectorSize"
+        }
+    }
+
+    Test-Case 'The three volatile bytes are excluded' {
+        Initialize-SpooferRandom -Seed 11
+        $a = Get-SpooferRandomByte -Count (12 * 512)
+        $b = New-Object byte[] $a.Length
+        [System.Array]::Copy($a, $b, $a.Length)
+
+        # VolumeFlags and PercentInUse change while the volume is mounted, so the
+        # checksum has to be blind to them or it would go stale on its own.
+        $b[106] = [byte](($a[106] + 1) % 256)
+        $b[107] = [byte](($a[107] + 7) % 256)
+        $b[112] = [byte](($a[112] + 9) % 256)
+
+        $first  = & $exfatModule { param($r) Get-ExFatBootChecksum -Region $r -SectorSize 512 } $a
+        $second = & $exfatModule { param($r) Get-ExFatBootChecksum -Region $r -SectorSize 512 } $b
+        Assert-Equal $first $second
+    }
+
+    Test-Case 'Any other byte does change the checksum' {
+        Initialize-SpooferRandom -Seed 12
+        $a = Get-SpooferRandomByte -Count (12 * 512)
+        $b = New-Object byte[] $a.Length
+        [System.Array]::Copy($a, $b, $a.Length)
+        $b[0x64] = [byte](($a[0x64] + 1) % 256)
+
+        Assert-NotEqual `
+            (& $exfatModule { param($r) Get-ExFatBootChecksum -Region $r -SectorSize 512 } $a) `
+            (& $exfatModule { param($r) Get-ExFatBootChecksum -Region $r -SectorSize 512 } $b)
+    }
+
+    Test-Case 'The checksum sector is filled with the repeated value' {
+        Initialize-SpooferRandom -Seed 13
+        $region = Get-SpooferRandomByte -Count (12 * 512)
+
+        & $exfatModule { param($r) Set-ExFatBootChecksum -Region $r -SectorSize 512 -RegionOffset 0 } $region
+
+        $expected = & $exfatModule { param($r) Get-ExFatBootChecksum -Region $r -SectorSize 512 } $region
+        for ($offset = 11 * 512; $offset -lt 12 * 512; $offset += 4) {
+            Assert-Equal $expected ([System.BitConverter]::ToUInt32($region, $offset)) "checksum copy at $offset"
+        }
+    }
+
+    Test-Case 'A backup region is checksummed independently of the main one' {
+        Initialize-SpooferRandom -Seed 14
+        $both = Get-SpooferRandomByte -Count (24 * 512)
+
+        & $exfatModule { param($r) Set-ExFatBootChecksum -Region $r -SectorSize 512 -RegionOffset 0 } $both
+        & $exfatModule { param($r) Set-ExFatBootChecksum -Region $r -SectorSize 512 -RegionOffset (12 * 512) } $both
+
+        $mainSlice = New-Object byte[] (11 * 512)
+        [System.Array]::Copy($both, 0, $mainSlice, 0, $mainSlice.Length)
+        $backupSlice = New-Object byte[] (11 * 512)
+        [System.Array]::Copy($both, 12 * 512, $backupSlice, 0, $backupSlice.Length)
+
+        Assert-Equal (& $exfatModule { param($r) Get-ExFatBootChecksum -Region $r -SectorSize 512 } $mainSlice) `
+                     ([System.BitConverter]::ToUInt32($both, 11 * 512))
+        Assert-Equal (& $exfatModule { param($r) Get-ExFatBootChecksum -Region $r -SectorSize 512 } $backupSlice) `
+                     ([System.BitConverter]::ToUInt32($both, 23 * 512))
+    }
+}
+
+Describe-Group 'Monitor EDID' {
+
+    $edidModule = Import-Module (Join-Path $sourceDir 'Providers/13-MonitorEdid.psm1') -Force -PassThru -DisableNameChecking
+
+    function New-FakeEdid {
+        param([switch]$WithSerialDescriptor)
+
+        $edid = New-Object byte[] 128
+        foreach ($pair in @(@(0, 0x00), @(1, 0xFF), @(2, 0xFF), @(3, 0xFF), @(4, 0xFF), @(5, 0xFF), @(6, 0xFF), @(7, 0x00))) {
+            $edid[$pair[0]] = [byte]$pair[1]
+        }
+        [System.Array]::Copy([System.BitConverter]::GetBytes([uint32]0x11223344), 0, $edid, 12, 4)
+
+        if ($WithSerialDescriptor) {
+            # Descriptor 1: zero flag bytes plus tag 0xFF marks a printed serial.
+            $offset = 54 + 18
+            $edid[$offset] = 0; $edid[$offset + 1] = 0; $edid[$offset + 2] = 0
+            $edid[$offset + 3] = 0xFF
+            $edid[$offset + 4] = 0
+            $text = [System.Text.Encoding]::ASCII.GetBytes('OLDSERIAL123')
+            [System.Array]::Copy($text, 0, $edid, $offset + 5, $text.Length)
+        }
+
+        $sum = 0
+        for ($i = 0; $i -lt 127; $i++) { $sum = ($sum + $edid[$i]) -band 0xFF }
+        $edid[127] = [byte]((256 - $sum) -band 0xFF)
+
+        return $edid
+    }
+
+    Test-Case 'The EDID header is required' {
+        Assert-True (& $edidModule { param($e) Test-EdidBlob -Edid $e } (New-FakeEdid))
+        Assert-True (-not (& $edidModule { param($e) Test-EdidBlob -Edid $e } ([byte[]]::new(128))))
+        Assert-True (-not (& $edidModule { param($e) Test-EdidBlob -Edid $e } ([byte[]]::new(16)))) 'too short to be an EDID'
+        Assert-True (-not (& $edidModule { param($e) Test-EdidBlob -Edid $e } $null))
+    }
+
+    Test-Case 'A well-formed block validates, a tampered one does not' {
+        $edid = New-FakeEdid
+        Assert-True (& $edidModule { param($e) Test-EdidChecksum -Edid $e -BlockOffset 0 } $edid)
+
+        $edid[20] = [byte](($edid[20] + 1) % 256)
+        Assert-True (-not (& $edidModule { param($e) Test-EdidChecksum -Edid $e -BlockOffset 0 } $edid))
+    }
+
+    Test-Case 'Spoofing changes the serial and leaves the checksum valid' {
+        Initialize-SpooferRandom -Seed 21
+        $original = New-FakeEdid
+        $updated  = & $edidModule { param($e) New-SpoofedEdid -Current $e } $original
+
+        Assert-Equal 128 $updated.Length
+        Assert-NotEqual (& $edidModule { param($e) Get-EdidSerialNumber -Edid $e } $original) `
+                        (& $edidModule { param($e) Get-EdidSerialNumber -Edid $e } $updated)
+        Assert-True (& $edidModule { param($e) Test-EdidChecksum -Edid $e -BlockOffset 0 } $updated) `
+            'a block whose checksum does not add up is treated as corrupt'
+    }
+
+    Test-Case 'The original blob is not modified in place' {
+        Initialize-SpooferRandom -Seed 22
+        $original = New-FakeEdid
+        $before   = & $edidModule { param($e) Get-EdidSerialNumber -Edid $e } $original
+
+        & $edidModule { param($e) New-SpoofedEdid -Current $e } $original | Out-Null
+
+        Assert-Equal $before (& $edidModule { param($e) Get-EdidSerialNumber -Edid $e } $original)
+    }
+
+    Test-Case 'A printed serial descriptor is rewritten too' {
+        Initialize-SpooferRandom -Seed 23
+        $original = New-FakeEdid -WithSerialDescriptor
+        $updated  = & $edidModule { param($e) New-SpoofedEdid -Current $e } $original
+
+        $text = [System.Text.Encoding]::ASCII.GetString($updated, 54 + 18 + 5, 13)
+        Assert-True ($text -notmatch 'OLDSERIAL') "the printed serial survived as '$text'"
+        Assert-Match "`n|`r|^[A-Z0-9]+" $text.Trim() 'the replacement should be printable'
+        Assert-True (& $edidModule { param($e) Test-EdidChecksum -Edid $e -BlockOffset 0 } $updated)
+    }
+
+    Test-Case 'Descriptors that are not serials are left alone' {
+        Initialize-SpooferRandom -Seed 24
+        $original = New-FakeEdid
+        # Descriptor 2 carries tag 0xFC (display name), which must not be touched.
+        $offset = 54 + 36
+        $original[$offset + 3] = 0xFC
+        $name = [System.Text.Encoding]::ASCII.GetBytes('MONITOR NAME')
+        [System.Array]::Copy($name, 0, $original, $offset + 5, $name.Length)
+
+        $updated = & $edidModule { param($e) New-SpoofedEdid -Current $e } $original
+        Assert-Equal 'MONITOR NAME' ([System.Text.Encoding]::ASCII.GetString($updated, $offset + 5, 12))
+    }
+
+    Test-Case 'Something that is not an EDID is returned untouched' {
+        $notEdid = [byte[]]::new(128)
+        $result  = & $edidModule { param($e) New-SpoofedEdid -Current $e } $notEdid
+        Assert-Equal 128 $result.Length
+        for ($i = 0; $i -lt 128; $i++) { Assert-Equal 0 $result[$i] }
+    }
+}
+
+Describe-Group 'Digital product id' {
+
+    $productModule = Import-Module (Join-Path $sourceDir 'Providers/12-DigitalProductId.psm1') -Force -PassThru -DisableNameChecking
+
+    function New-FakeProductId {
+        param([int]$Length = 164)
+        $blob = New-Object byte[] $Length
+        [System.Array]::Copy([System.BitConverter]::GetBytes([uint32]$Length), 0, $blob, 0, 4)
+        for ($i = 4; $i -lt $Length; $i++) { $blob[$i] = [byte]($i % 256) }
+        return $blob
+    }
+
+    Test-Case 'The length and its length field are preserved' {
+        Initialize-SpooferRandom -Seed 31
+        foreach ($length in @(164, 1272)) {
+            $original = New-FakeProductId -Length $length
+            $updated  = & $productModule { param($b) New-SpoofedProductIdBlob -Current $b } $original
+
+            Assert-Equal $length $updated.Length
+            Assert-Equal ([uint32]$length) ([System.BitConverter]::ToUInt32($updated, 0)) 'the leading length field must still describe the blob'
+        }
+    }
+
+    Test-Case 'The body is actually randomised' {
+        Initialize-SpooferRandom -Seed 32
+        $original = New-FakeProductId
+        $updated  = & $productModule { param($b) New-SpoofedProductIdBlob -Current $b } $original
+
+        $differences = 0
+        for ($i = 4; $i -lt $original.Length; $i++) {
+            if ($original[$i] -ne $updated[$i]) { $differences++ }
+        }
+        Assert-True ($differences -gt ($original.Length / 2)) "only $differences bytes changed"
+    }
+
+    Test-Case 'The original blob is not modified in place' {
+        Initialize-SpooferRandom -Seed 33
+        $original = New-FakeProductId
+        & $productModule { param($b) New-SpoofedProductIdBlob -Current $b } $original | Out-Null
+        Assert-Equal 8 $original[8] 'the source array must be left as it was'
+    }
+
+    Test-Case 'A missing or truncated blob is passed straight through' {
+        Assert-Equal $null (& $productModule { param($b) New-SpoofedProductIdBlob -Current $b } $null)
+
+        $short = [byte[]](1, 2, 3, 4)
+        $result = & $productModule { param($b) New-SpoofedProductIdBlob -Current $b } $short
+        Assert-Equal 4 $result.Length
     }
 }
 

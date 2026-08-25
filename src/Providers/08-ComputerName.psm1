@@ -56,7 +56,7 @@ function Get-SpooferProviderDefinition {
         Title          = 'Computer name'
         Tier           = 'Advanced'
         RequiresReboot = $true
-        Description    = 'Rewrites the hostname in all four locations Windows keeps it. Skipped on domain-joined machines unless -Force is given, because renaming breaks the computer account''s trust with the domain.'
+        Description    = 'Rewrites the hostname in all four locations Windows keeps it. Domain-joined machines are renamed too, which breaks the computer account''s trust until the machine is re-joined - pass -SkipDomainRename to leave a domain-joined machine alone.'
         Targets        = @(
             'HKLM\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName'
             'HKLM\SYSTEM\CurrentControlSet\Control\ComputerName\ActiveComputerName'
@@ -72,7 +72,7 @@ function Get-SpooferProviderDefinition {
                 $rows += [pscustomobject]@{
                     Item  = 'Domain membership'
                     Value = 'joined'
-                    Note  = 'renaming is skipped unless -Force is given'
+                    Note  = 'renaming will require re-joining the domain'
                 }
             }
             $rows
@@ -81,9 +81,13 @@ function Get-SpooferProviderDefinition {
         Invoke = {
             param($Session, $Context)
 
-            if ((Test-DomainJoined) -and -not $Context.Force) {
-                Write-SpooferLog -Level Warn -Message 'This machine is domain-joined; skipping the rename. Re-run with -Force to override, then re-join the domain afterwards.'
-                return @()
+            if (Test-DomainJoined) {
+                if (Get-SpooferOption -Context $Context -Name 'SkipDomainRename' -Default $false) {
+                    Write-SpooferLog -Level Warn -Message 'This machine is domain-joined and -SkipDomainRename was given; leaving the hostname alone.'
+                    return @()
+                }
+
+                Write-SpooferLog -Level Warn -Message 'This machine is domain-joined. Renaming it breaks the computer account''s trust with the domain: after the restart, re-join it (or restore this backup) before expecting domain sign-in to work.'
             }
 
             $newName = New-SpooferComputerName

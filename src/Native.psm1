@@ -158,34 +158,37 @@ namespace Spoofer
             return DeviceIoControl(handle, code, IntPtr.Zero, 0, IntPtr.Zero, 0, out returned, IntPtr.Zero);
         }
 
-        private static void Rewind(SafeFileHandle handle)
+        private static void Seek(SafeFileHandle handle, long byteOffset)
         {
-            if (!SetFilePointerEx(handle, 0, IntPtr.Zero, 0 /* FILE_BEGIN */))
+            if (!SetFilePointerEx(handle, byteOffset, IntPtr.Zero, 0 /* FILE_BEGIN */))
                 throw new Win32Exception(Marshal.GetLastWin32Error(), "SetFilePointerEx failed.");
         }
 
-        /// <summary>Reads the first sector of a volume, e.g. ReadBootSector(@"\\.\D:", 512).</summary>
-        public static byte[] ReadBootSector(string volumePath, int sectorSize)
+        /// <summary>
+        /// Reads a run of sectors from a volume. byteOffset and length must both
+        /// be multiples of the volume's logical sector size.
+        /// </summary>
+        public static byte[] ReadSectors(string volumePath, long byteOffset, int length)
         {
             using (SafeFileHandle handle = OpenVolume(volumePath, false))
             {
-                byte[] buffer = new byte[sectorSize];
+                byte[] buffer = new byte[length];
                 uint read;
-                Rewind(handle);
-                if (!ReadFile(handle, buffer, (uint)sectorSize, out read, IntPtr.Zero))
+                Seek(handle, byteOffset);
+                if (!ReadFile(handle, buffer, (uint)length, out read, IntPtr.Zero))
                     throw new Win32Exception(Marshal.GetLastWin32Error(), "ReadFile failed on " + volumePath + ".");
-                if (read != sectorSize)
-                    throw new IOException("Short read from " + volumePath + ": " + read + " of " + sectorSize + " bytes.");
+                if (read != length)
+                    throw new IOException("Short read from " + volumePath + ": " + read + " of " + length + " bytes.");
                 return buffer;
             }
         }
 
         /// <summary>
-        /// Writes the first sector of a volume. The volume is locked first; when
+        /// Writes a run of sectors to a volume. The volume is locked first; when
         /// allowDismount is set and the lock fails because handles are open, the
-        /// volume is dismounted instead so Windows re-reads the sector on next access.
+        /// volume is dismounted instead so Windows re-reads it on next access.
         /// </summary>
-        public static void WriteBootSector(string volumePath, byte[] sector, bool allowDismount)
+        public static void WriteSectors(string volumePath, long byteOffset, byte[] data, bool allowDismount)
         {
             using (SafeFileHandle handle = OpenVolume(volumePath, true))
             {
@@ -201,11 +204,11 @@ namespace Spoofer
                 try
                 {
                     uint written;
-                    Rewind(handle);
-                    if (!WriteFile(handle, sector, (uint)sector.Length, out written, IntPtr.Zero))
+                    Seek(handle, byteOffset);
+                    if (!WriteFile(handle, data, (uint)data.Length, out written, IntPtr.Zero))
                         throw new Win32Exception(Marshal.GetLastWin32Error(), "WriteFile failed on " + volumePath + ".");
-                    if (written != sector.Length)
-                        throw new IOException("Short write to " + volumePath + ": " + written + " of " + sector.Length + " bytes.");
+                    if (written != data.Length)
+                        throw new IOException("Short write to " + volumePath + ": " + written + " of " + data.Length + " bytes.");
                 }
                 finally
                 {
@@ -274,7 +277,10 @@ function Enable-SpooferPrivilege {
     [OutputType([bool])]
     param(
         [Parameter(Mandatory)]
-        [ValidateSet('SeTakeOwnershipPrivilege', 'SeRestorePrivilege', 'SeBackupPrivilege', 'SeSecurityPrivilege')]
+        [ValidateSet(
+            'SeTakeOwnershipPrivilege', 'SeRestorePrivilege', 'SeBackupPrivilege',
+            'SeSecurityPrivilege', 'SeManageVolumePrivilege', 'SeSystemEnvironmentPrivilege',
+            'SeShutdownPrivilege', 'SeLoadDriverPrivilege')]
         [string]$Privilege
     )
 
@@ -290,10 +296,119 @@ function Enable-SpooferPrivilege {
     }
 }
 
+function Enable-SpooferPrivilegeSet {
+    <#
+    .SYNOPSIS
+        Switches on every privilege the toolkit can make use of.
+    .DESCRIPTION
+        An elevated token holds these but leaves most of them disabled. Turning
+        them on once at start-up means a provider that needs to take ownership of
+        a key, or open a volume for direct I/O, is not the one discovering it
+        cannot. Privileges the token genuinely lacks are reported and skipped.
+    .OUTPUTS
+        The names that were successfully enabled.
+    #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param(
+        [string[]]$Privilege = @(
+            'SeTakeOwnershipPrivilege'
+            'SeRestorePrivilege'
+            'SeBackupPrivilege'
+            'SeSecurityPrivilege'
+            'SeManageVolumePrivilege'
+            'SeSystemEnvironmentPrivilege'
+            'SeShutdownPrivilege'
+        )
+    )
+
+    $enabled = New-Object System.Collections.ArrayList
+
+    foreach ($name in $Privilege) {
+        if (Enable-SpooferPrivilege -Privilege $name) { [void]$enabled.Add($name) }
+    }
+
+    if ($enabled.Count) {
+        Write-SpooferLog -Level Debug -Message ('Privileges enabled: {0}' -f ($enabled -join ', '))
+    }
+
+    return @($enabled)
+}
+
+function Read-SpooferVolumeSector {
+    <#
+    .SYNOPSIS
+        Reads a run of sectors from a volume.
+    .PARAMETER ByteOffset
+        Offset from the start of the volume. Must be a multiple of the sector
+        size: direct volume I/O is only permitted on sector boundaries.
+    .PARAMETER Length
+        Bytes to read, also a multiple of the sector size.
+    #>
+    [CmdletBinding()]
+    [OutputType([byte[]])]
+    param(
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[A-Za-z]$')]
+        [string]$DriveLetter,
+
+        [long]$ByteOffset = 0,
+
+        [Parameter(Mandatory)]
+        [int]$Length,
+
+        [ValidateSet(512, 1024, 2048, 4096)]
+        [int]$SectorSize = 512
+    )
+
+    if (-not (Initialize-SpooferNative)) {
+        throw 'Native interop is unavailable, so raw volume access is not possible.'
+    }
+
+    if (($ByteOffset % $SectorSize) -ne 0) { throw "ByteOffset $ByteOffset is not a multiple of the $SectorSize-byte sector size." }
+    if (($Length % $SectorSize) -ne 0)     { throw "Length $Length is not a multiple of the $SectorSize-byte sector size." }
+
+    $path = '\\.\{0}:' -f $DriveLetter.ToUpperInvariant()
+    return ,([Spoofer.Native]::ReadSectors($path, $ByteOffset, $Length))
+}
+
+function Write-SpooferVolumeSector {
+    <#
+    .SYNOPSIS
+        Writes a run of sectors back to a volume, locking or dismounting it first.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[A-Za-z]$')]
+        [string]$DriveLetter,
+
+        [long]$ByteOffset = 0,
+
+        [Parameter(Mandatory)]
+        [byte[]]$Data,
+
+        [ValidateSet(512, 1024, 2048, 4096)]
+        [int]$SectorSize = 512,
+
+        [switch]$AllowDismount
+    )
+
+    if (-not (Initialize-SpooferNative)) {
+        throw 'Native interop is unavailable, so raw volume access is not possible.'
+    }
+
+    if (($ByteOffset % $SectorSize) -ne 0)   { throw "ByteOffset $ByteOffset is not a multiple of the $SectorSize-byte sector size." }
+    if (($Data.Length % $SectorSize) -ne 0)  { throw "Data length $($Data.Length) is not a multiple of the $SectorSize-byte sector size." }
+
+    $path = '\\.\{0}:' -f $DriveLetter.ToUpperInvariant()
+    [Spoofer.Native]::WriteSectors($path, $ByteOffset, $Data, [bool]$AllowDismount)
+}
+
 function Read-SpooferBootSector {
     <#
     .SYNOPSIS
-        Reads the first sector of a volume, e.g. -DriveLetter D.
+        Reads the first sector of a volume. Shorthand over Read-SpooferVolumeSector.
     #>
     [CmdletBinding()]
     [OutputType([byte[]])]
@@ -306,18 +421,13 @@ function Read-SpooferBootSector {
         [int]$SectorSize = 512
     )
 
-    if (-not (Initialize-SpooferNative)) {
-        throw 'Native interop is unavailable, so raw volume access is not possible.'
-    }
-
-    $path = '\\.\{0}:' -f $DriveLetter.ToUpperInvariant()
-    return ,([Spoofer.Native]::ReadBootSector($path, $SectorSize))
+    return ,(Read-SpooferVolumeSector -DriveLetter $DriveLetter -ByteOffset 0 -Length $SectorSize -SectorSize $SectorSize)
 }
 
 function Write-SpooferBootSector {
     <#
     .SYNOPSIS
-        Writes the first sector of a volume back, locking or dismounting it first.
+        Writes the first sector of a volume. Shorthand over Write-SpooferVolumeSector.
     #>
     [CmdletBinding()]
     param(
@@ -331,18 +441,17 @@ function Write-SpooferBootSector {
         [switch]$AllowDismount
     )
 
-    if (-not (Initialize-SpooferNative)) {
-        throw 'Native interop is unavailable, so raw volume access is not possible.'
-    }
-
-    $path = '\\.\{0}:' -f $DriveLetter.ToUpperInvariant()
-    [Spoofer.Native]::WriteBootSector($path, $Sector, [bool]$AllowDismount)
+    Write-SpooferVolumeSector -DriveLetter $DriveLetter -ByteOffset 0 -Data $Sector `
+        -SectorSize $Sector.Length -AllowDismount:$AllowDismount
 }
 
 Export-ModuleMember -Function @(
     'Initialize-SpooferNative'
     'Test-SpooferNativeReady'
     'Enable-SpooferPrivilege'
+    'Enable-SpooferPrivilegeSet'
+    'Read-SpooferVolumeSector'
+    'Write-SpooferVolumeSector'
     'Read-SpooferBootSector'
     'Write-SpooferBootSector'
 )

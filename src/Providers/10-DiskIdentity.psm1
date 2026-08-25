@@ -1,10 +1,19 @@
 <#
 .SYNOPSIS
     Disk-level identifiers: the GPT disk GUID and the MBR disk signature.
-.NOTES
+.DESCRIPTION
     These are the identifiers written in the partition table, not the serial
-    number burned into the drive's firmware - that one is not writable from
-    user mode at all. See docs/limitations.md.
+    number burned into the drive's firmware - that one is not writable from user
+    mode at all. See docs/limitations.md.
+
+    Changing the MBR signature of the disk Windows boots from is handled rather
+    than avoided. The boot configuration references that signature by value, so
+    the store is exported to the backup first, the signature is changed, and
+    bcdboot then rewrites the boot entries against the new one. If any part of
+    that fails the signature is put straight back and the store re-imported, so
+    the disk never sits in a state where the boot entries disagree with it.
+.NOTES
+    A reboot is the only real test of a repaired boot configuration.
 #>
 
 Set-StrictMode -Version Latest
@@ -15,8 +24,8 @@ Import-Module (Join-Path (Split-Path $PSScriptRoot -Parent) 'BackupStore.psm1') 
 function Get-SpooferDisk {
     <#
     .SYNOPSIS
-        Disks that carry a rewritable identifier, with the flags needed to
-        decide whether touching them is safe.
+        Disks carrying a rewritable identifier, with the flags needed to decide
+        how much care each one needs.
     #>
     [CmdletBinding()]
     param()
@@ -31,12 +40,7 @@ function Get-SpooferDisk {
     foreach ($disk in $disks) {
         if ($disk.PartitionStyle -eq 'RAW') { continue }
 
-        # An MBR signature is referenced by the boot configuration data, so
-        # changing it on the disk Windows boots from leaves the machine
-        # unbootable. GPT boot entries reference partition GUIDs instead, which
-        # this provider never touches, so the disk GUID is safe to rewrite.
         $isBootCritical = ([bool]$disk.IsBoot -or [bool]$disk.IsSystem)
-        $bootUnsafe     = ($disk.PartitionStyle -eq 'MBR' -and $isBootCritical)
 
         [pscustomobject]@{
             Number         = [int]$disk.Number
@@ -46,7 +50,10 @@ function Get-SpooferDisk {
             Guid           = [string]$disk.Guid
             Signature      = $disk.Signature
             IsBootCritical = $isBootCritical
-            BootUnsafe     = $bootUnsafe
+            # Only an MBR boot disk needs the boot configuration repaired
+            # afterwards: GPT boot entries reference partition GUIDs, which this
+            # provider does not touch.
+            NeedsBcdRepair = ($disk.PartitionStyle -eq 'MBR' -and $isBootCritical)
             IsReadOnly     = [bool]$disk.IsReadOnly
         }
     }
@@ -71,6 +78,84 @@ function Set-SpooferDiskIdentity {
     }
 }
 
+function Export-SpooferBcdStore {
+    <#
+    .SYNOPSIS
+        Exports the boot configuration data store to a file.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Force }
+
+    $result = Invoke-SpooferProcess -FilePath 'bcdedit.exe' -ArgumentList @('/export', ('"{0}"' -f $Path))
+    if (-not $result.Success) {
+        throw ("bcdedit /export failed ({0}): {1}" -f $result.ExitCode, ($result.Error + $result.Output).Trim())
+    }
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw 'bcdedit /export reported success but wrote no file.'
+    }
+
+    return $Path
+}
+
+function Import-SpooferBcdStore {
+    <#
+    .SYNOPSIS
+        Restores a previously exported boot configuration data store.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw "The exported boot configuration store is missing from '$Path'."
+    }
+
+    $result = Invoke-SpooferProcess -FilePath 'bcdedit.exe' -ArgumentList @('/import', ('"{0}"' -f $Path))
+    if (-not $result.Success) {
+        throw ("bcdedit /import failed ({0}): {1}" -f $result.ExitCode, ($result.Error + $result.Output).Trim())
+    }
+}
+
+function Repair-SpooferBootConfiguration {
+    <#
+    .SYNOPSIS
+        Rewrites the boot entries so they reference the disk's new signature.
+    .DESCRIPTION
+        bcdboot with no /s picks the system partition itself, which matters
+        because on a BIOS system that partition often has no drive letter. The
+        result is verified by enumerating the default entry: bcdboot reporting
+        success while leaving an unreadable store would otherwise go unnoticed
+        until the machine failed to boot.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param()
+
+    $firmware = if ($env:firmware_type) { $env:firmware_type } else { 'Legacy' }
+    $format   = if ($firmware -eq 'UEFI') { 'UEFI' } else { 'BIOS' }
+
+    $result = Invoke-SpooferProcess -FilePath 'bcdboot.exe' -ArgumentList @(('"{0}"' -f $env:SystemRoot), '/f', $format)
+
+    if (-not $result.Success) {
+        Write-SpooferLog -Level Error -Message ("bcdboot failed ({0}): {1}" -f $result.ExitCode, ($result.Error + $result.Output).Trim())
+        return $false
+    }
+
+    $verify = Invoke-SpooferProcess -FilePath 'bcdedit.exe' -ArgumentList @('/enum', '{default}')
+    if (-not $verify.Success) {
+        Write-SpooferLog -Level Error -Message 'bcdboot reported success but the boot store could not be read back.'
+        return $false
+    }
+
+    Write-SpooferLog -Level Success -Message "Boot configuration rewritten for $format firmware."
+    return $true
+}
+
 Register-SpooferRestoreHandler -Type 'DiskId' -Handler {
     param($Entry)
 
@@ -92,7 +177,19 @@ Register-SpooferRestoreHandler -Type 'DiskId' -Handler {
     }
 
     Set-Disk -Number $Entry.Number -Signature ([uint32]$Entry.Value) -ErrorAction Stop
+
+    # The exported store is replayed by its own BcdStore entry, which was added
+    # before this one and so is restored after it - by which point the signature
+    # it refers to is back in place.
     return "Disk $($Entry.Number) MBR signature restored."
+}
+
+Register-SpooferRestoreHandler -Type 'BcdStore' -Handler {
+    param($Entry)
+
+    $path = Join-Path $Entry.SessionPath $Entry.File
+    Import-SpooferBcdStore -Path $path
+    return 'Boot configuration store re-imported.'
 }
 
 function Get-SpooferProviderDefinition {
@@ -101,8 +198,8 @@ function Get-SpooferProviderDefinition {
         Title          = 'Disk GUID / MBR signature'
         Tier           = 'Advanced'
         RequiresReboot = $false
-        Description    = 'Rewrites the GPT disk GUID, or the MBR disk signature on non-boot disks. The MBR signature of a boot disk is skipped because the boot configuration references it.'
-        Targets        = @('Partition table of every initialised disk')
+        Description    = 'Rewrites the GPT disk GUID or the MBR disk signature on every disk. On an MBR boot disk the boot configuration is exported first and rewritten with bcdboot afterwards, and both are rolled back together if the repair fails.'
+        Targets        = @('Partition table of every initialised disk', 'Boot configuration data store, on an MBR boot disk')
 
         GetState = {
             param($Context)
@@ -116,9 +213,9 @@ function Get-SpooferProviderDefinition {
                 $value = if ($disk.PartitionStyle -eq 'GPT') { $disk.Guid } else { '0x{0:X8}' -f $disk.Signature }
 
                 $note = $disk.PartitionStyle
-                if ($disk.BootUnsafe)         { $note += ', boot disk - skipped' }
-                elseif ($disk.IsBootCritical) { $note += ', boot disk' }
-                if ($disk.IsReadOnly)         { $note += ', read-only' }
+                if ($disk.NeedsBcdRepair)      { $note += ', boot disk - boot config will be rewritten' }
+                elseif ($disk.IsBootCritical)  { $note += ', boot disk' }
+                if ($disk.IsReadOnly)          { $note += ', read-only' }
 
                 [pscustomobject]@{
                     Item  = 'Disk {0} [{1}]' -f $disk.Number, $disk.FriendlyName
@@ -143,12 +240,11 @@ function Get-SpooferProviderDefinition {
                 $label = 'Disk {0} {1} id' -f $disk.Number, $disk.PartitionStyle
 
                 if ($disk.IsReadOnly) {
-                    Write-SpooferLog -Level Warn -Message "Skipping disk $($disk.Number): it is read-only."
-                    continue
-                }
-
-                if ($disk.BootUnsafe) {
-                    Write-SpooferLog -Level Warn -Message "Skipping disk $($disk.Number): changing an MBR boot disk's signature would break the boot configuration."
+                    Write-SpooferLog -Level Warn -Message "Skipping disk $($disk.Number): the disk is marked read-only, so nothing can be written to it."
+                    [void]$results.Add([pscustomobject]@{
+                        Label = $label; OldValue = $null; NewValue = $null
+                        Changed = $false; Simulated = $false; Skipped = $true; Reason = 'Disk is read-only'
+                    })
                     continue
                 }
 
@@ -161,11 +257,41 @@ function Get-SpooferProviderDefinition {
 
                 if ($Context.DryRun) {
                     Write-SpooferChange -Label $label -OldValue $oldValue -NewValue $newValue -Simulated
+                    if ($disk.NeedsBcdRepair) {
+                        Write-SpooferLog -Level Info -Message "Disk $($disk.Number) is the MBR boot disk; the boot configuration would be exported and rewritten with bcdboot."
+                    }
                     [void]$results.Add([pscustomobject]@{
                         Label = $label; OldValue = $oldValue; NewValue = $newValue
                         Changed = $false; Simulated = $true; Skipped = $false; Reason = ''
                     })
                     continue
+                }
+
+                $bcdExportPath = $null
+
+                if ($disk.NeedsBcdRepair) {
+                    Write-SpooferLog -Level Warn -Message "Disk $($disk.Number) is the MBR boot disk. Exporting the boot configuration before touching its signature."
+                    try {
+                        $fileName      = 'bcd-disk{0}.bcd' -f $disk.Number
+                        $bcdExportPath = New-SpooferBackupFilePath -Session $Session -Name $fileName
+                        Export-SpooferBcdStore -Path $bcdExportPath | Out-Null
+
+                        if ($Session) {
+                            # Added before the DiskId entry so that a restore,
+                            # which replays in reverse, puts the signature back
+                            # first and re-imports the store afterwards.
+                            Add-SpooferBackupEntry -Session $Session -Type 'BcdStore' -Module 'diskid' `
+                                -Label ('Boot configuration (disk {0})' -f $disk.Number) `
+                                -Data @{ SessionPath = $Session.Path; File = ('files\{0}' -f $fileName) } | Out-Null
+                        }
+                    } catch {
+                        Write-SpooferLog -Level Error -Message "Could not export the boot configuration: $($_.Exception.Message). Leaving disk $($disk.Number) alone rather than changing a signature that could not be backed out."
+                        [void]$results.Add([pscustomobject]@{
+                            Label = $label; OldValue = $oldValue; NewValue = $newValue
+                            Changed = $false; Simulated = $false; Skipped = $true; Reason = 'Boot configuration export failed'
+                        })
+                        continue
+                    }
                 }
 
                 if ($Session) {
@@ -179,18 +305,45 @@ function Get-SpooferProviderDefinition {
 
                 try {
                     Set-SpooferDiskIdentity -Number $disk.Number -PartitionStyle $disk.PartitionStyle -Value $newValue
-                    Write-SpooferChange -Label $label -OldValue $oldValue -NewValue $newValue
-                    [void]$results.Add([pscustomobject]@{
-                        Label = $label; OldValue = $oldValue; NewValue = $newValue
-                        Changed = $true; Simulated = $false; Skipped = $false; Reason = ''
-                    })
                 } catch {
                     Write-SpooferLog -Level Error -Message "Disk $($disk.Number): $($_.Exception.Message)"
                     [void]$results.Add([pscustomobject]@{
                         Label = $label; OldValue = $oldValue; NewValue = $newValue
                         Changed = $false; Simulated = $false; Skipped = $true; Reason = $_.Exception.Message
                     })
+                    continue
                 }
+
+                if ($disk.NeedsBcdRepair -and -not (Repair-SpooferBootConfiguration)) {
+                    Write-SpooferLog -Level Error -Message "Boot configuration repair failed. Rolling disk $($disk.Number) back so the machine still boots."
+                    try {
+                        Set-SpooferDiskIdentity -Number $disk.Number -PartitionStyle $disk.PartitionStyle -Value $oldValue
+                        if ($bcdExportPath) { Import-SpooferBcdStore -Path $bcdExportPath }
+                        Write-SpooferLog -Level Success -Message "Disk $($disk.Number) and its boot configuration are back as they were."
+                    } catch {
+                        Write-SpooferLog -Level Error -Message "ROLLBACK FAILED for disk $($disk.Number): $($_.Exception.Message)"
+                        Write-SpooferLog -Level Error -Message "Do not reboot. Put the signature back by hand with: Set-Disk -Number $($disk.Number) -Signature $oldValue"
+                        if ($bcdExportPath) {
+                            Write-SpooferLog -Level Error -Message "Then re-import the boot store with: bcdedit /import `"$bcdExportPath`""
+                        }
+                    }
+
+                    [void]$results.Add([pscustomobject]@{
+                        Label = $label; OldValue = $oldValue; NewValue = $newValue
+                        Changed = $false; Simulated = $false; Skipped = $true; Reason = 'Boot configuration repair failed; change rolled back'
+                    })
+                    continue
+                }
+
+                Write-SpooferChange -Label $label -OldValue $oldValue -NewValue $newValue
+                if ($disk.NeedsBcdRepair) {
+                    Write-SpooferLog -Level Warn -Message 'The boot configuration was rewritten, but only a restart proves it. Keep this backup until the machine has booted once.'
+                }
+
+                [void]$results.Add([pscustomobject]@{
+                    Label = $label; OldValue = $oldValue; NewValue = $newValue
+                    Changed = $true; Simulated = $false; Skipped = $false; Reason = ''
+                })
             }
 
             return @($results)

@@ -125,6 +125,21 @@ this does not touch, so a GPT disk GUID is safe to rewrite.
 On restore the disk's recorded serial is checked first, so an identifier is never
 written onto whatever now happens to hold that disk number.
 
+## edid - Advanced
+
+| Value | Location |
+|---|---|
+| EDID | `HKLM\SYSTEM\CurrentControlSet\Enum\DISPLAY\<monitor>\<instance>\Device Parameters\EDID` |
+
+Windows' cached copy of each display's EDID. Three things change: the 32-bit
+serial at bytes 12-15, the text of any descriptor block tagged 0xFF (the printed
+serial - leaving it would undo the point of changing the numeric one), and the
+block checksum at byte 127, which is recomputed so every byte of the block sums
+to zero modulo 256. Descriptors carrying anything else, such as the display name
+at tag 0xFC, are left alone, as are CTA-861 extension blocks.
+
+Windows rebuilds this cache from the display when the monitor is re-detected.
+
 ## productid - Risky
 
 | Value | Location |
@@ -138,30 +153,53 @@ Windows activation uses, is deliberately left alone, so changing this does not
 deactivate Windows. Third-party software that pinned a licence to it will see a
 different machine.
 
+## digitalproductid - Risky
+
+| Value | Location | Type |
+|---|---|---|
+| DigitalProductId | `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\DigitalProductId` | REG_BINARY |
+| DigitalProductId4 | `...\CurrentVersion\DigitalProductId4` | REG_BINARY |
+
+The binary form of the installed product key, and what the activation stack and
+the "installed key" readers parse. The blob length and the little-endian length
+field in the first four bytes are preserved so the structure stays valid; the
+rest is randomised, which means it no longer encodes a real key.
+
+Expect Windows to report a different or invalid key and to want re-activating.
+Both blobs are backed up byte for byte, so a restore returns the original key
+exactly.
+
 ## volumeserial - Risky
 
 The serial number in each fixed volume's boot record - the `XXXX-XXXX` value
 `vol` and `dir` print.
 
-| Filesystem | Offset | Width |
-|---|---|---|
-| NTFS | `0x48` | 8 bytes (Windows displays the low 32 bits) |
-| FAT32 | `0x43` | 4 bytes |
-| FAT16/FAT12 | `0x27` | 4 bytes |
-| exFAT | - | skipped; the boot region is checksummed across eleven sectors |
+| Filesystem | Offset | Width | What else is rewritten |
+|---|---|---|---|
+| NTFS | `0x48` | 8 bytes (Windows displays the low 32 bits) | The backup boot sector in the last sector of the partition |
+| exFAT | `0x64` | 4 bytes | The backup boot region, and the checksum sector of both regions |
+| FAT32 | `0x43` | 4 bytes | - |
+| FAT16/FAT12 | `0x27` | 4 bytes | - |
 
-Changing it means writing that sector back, so the whole original sector is saved
-to the backup session - both inline and as a file under `files\` - before
-anything is written. The volume is locked first; `-AllowVolumeDismount` dismounts
-it instead when files are open.
+Each filesystem needs a different amount of the volume rewritten, so the provider
+works out the full set of byte ranges first and saves every one of them - inline
+and as files under `files\` - before writing anything.
 
-The system volume is always skipped: its boot record cannot be locked while
-Windows is running from it.
+- **NTFS** keeps a second copy of its boot record in the last sector of the
+  partition. Its position comes from the sector count NTFS records at offset
+  0x28, read from the volume itself rather than inferred from the partition size,
+  and it is updated alongside the primary so the two never disagree.
+- **exFAT** follows each of its two boot regions with a checksum over the
+  region's first eleven sectors, skipping the three bytes that change while the
+  volume is mounted (VolumeFlags at 106 and 107, PercentInUse at 112). Both
+  regions get the new serial and both checksums are recomputed; without that the
+  volume stops mounting.
 
-On restore, the current sector's filesystem is checked against the backup before
-writing, so a volume reformatted or re-lettered since the backup is refused
-rather than overwritten.
+The volume is locked before any write, and dismounted if it cannot be locked -
+`-NoVolumeDismount` makes it refuse instead. The system volume is attempted like
+any other, but Windows will not let the volume it is running from be locked; see
+`limitations.md` for the offline procedure that does work.
 
-> NTFS keeps a backup boot sector at the end of the volume carrying the same
-> serial. It is only consulted when the primary is unreadable, so the two being
-> out of step is harmless - but `chkdsk` may mention it.
+On restore, the current boot record's filesystem is checked against the backup
+before writing, so a volume reformatted or re-lettered since the backup is
+refused rather than overwritten.

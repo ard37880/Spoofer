@@ -33,28 +33,59 @@ Changed successfully, then quietly restored by Windows:
   when the hardware configuration changes. The `smbios` module writes a coherent
   set, but a driver or hardware change can prompt a recalculation from the real
   firmware values.
+- **Monitor EDID** - the `edid` module rewrites Windows' cached copy. Windows
+  rebuilds that cache from the display itself whenever the monitor is
+  re-detected: a driver update, a cable swap, a different port.
 
 Re-run `-Action Status` after a few days if it matters to you.
 
-## Deliberately out of scope
+## Handled rather than avoided
 
-Refusals built into the tool, not oversights:
+Four things a hardware ID tool usually declines to touch. All of them run by
+default here, each with the work that makes it safe:
 
-- **The MBR signature of a boot disk.** The boot configuration data references it
-  by value; changing it leaves the machine unbootable. GPT disk GUIDs do not have
-  this problem, and are changed. `diskid` skips MBR boot disks and says so.
-- **The system volume's serial.** Its boot record cannot be locked while Windows
-  is running from it. `volumeserial` handles other fixed volumes only. Changing
-  the system volume's serial needs a boot from other media.
+- **The MBR signature of a boot disk.** The boot configuration references it by
+  value, so `diskid` exports the boot store into the backup with
+  `bcdedit /export`, changes the signature, and rewrites the boot entries with
+  `bcdboot`. If the export fails the disk is left alone; if the repair fails the
+  signature is put straight back and the store re-imported. On a total failure
+  the exact recovery commands are printed. **A restart is the only real proof
+  that a repaired boot configuration works - keep the backup until the machine
+  has booted once.**
 - **exFAT volume serials.** The exFAT boot region carries a checksum over eleven
-  sectors. Writing four bytes without recomputing it produces a volume Windows
-  may refuse to mount. `volumeserial` skips exFAT rather than risk it.
-- **`DigitalProductId` / `DigitalProductId4`.** Windows activation reads these.
-  The `productid` module rewrites the `ProductId` *string*, which is what
-  licensing checks tend to look at, and leaves activation alone.
-- **Domain-joined renames.** Renaming a domain-joined machine breaks its computer
-  account's trust with the domain. `computername` skips it unless you pass
-  `-Force`, and you will need to re-join afterwards.
+  sectors, which is why most tools skip it. `volumeserial` writes the serial into
+  both the main and backup boot regions and recomputes both checksums, so the
+  volume still mounts. The checksum is cross-checked against the specification
+  formula in the test suite.
+- **The NTFS backup boot sector.** NTFS keeps a second copy of its boot record in
+  the last sector of the partition, carrying the same serial. Its position is
+  derived from the sector count NTFS records at offset 0x28 rather than guessed
+  from the partition size, and it is updated alongside the primary so the two
+  never disagree.
+- **Domain-joined renames.** `computername` renames a domain-joined machine like
+  any other. This breaks the computer account's trust with the domain: re-join
+  it after the restart, or restore the backup. `-SkipDomainRename` leaves a
+  domain-joined machine alone.
+
+## Still not possible from a running Windows
+
+- **The system volume's serial.** Windows will not grant an exclusive lock on the
+  volume it is running from, and it cannot be dismounted either. `volumeserial`
+  attempts it like any other volume and reports the refusal rather than skipping
+  it silently.
+
+  It does work offline. Boot from Windows PE or another Windows installation,
+  where that volume is no longer the system volume, and run the same command:
+
+  ```powershell
+  .\Spoofer.ps1 -Action Spoof -Module volumeserial
+  ```
+
+- **`DigitalProductId` and activation.** `digitalproductid` rewrites the blobs
+  and keeps their length and length field intact, but the contents no longer
+  encode a valid key. Expect Windows to report a different or invalid key and to
+  want re-activating. Restoring the backup puts the original key back byte for
+  byte.
 
 ## Things that can go wrong
 
@@ -66,13 +97,28 @@ Refusals built into the tool, not oversights:
   ownership and grants Administrators full control when a write is denied. The
   original security descriptor is backed up first and a restore hands the key
   back to its previous owner.
-- **A locked volume.** `volumeserial` needs an exclusive lock on the volume. If
-  anything has a file open on it, the write fails cleanly and nothing is changed.
-  `-AllowVolumeDismount` dismounts the volume instead, which is safe but will make
-  open handles fail.
+- **A locked volume.** `volumeserial` needs an exclusive lock on the volume, and
+  dismounts it when it cannot get one - that is the default, because in practice
+  most volumes have something open on them. `-NoVolumeDismount` makes it fail
+  cleanly instead, changing nothing.
 - **Drive letters can move.** Changing a GPT disk GUID does not disturb the
   `MountedDevices` mappings, which key on partition GUIDs. Changing an MBR
   signature on a data disk can, so its letters may be reassigned on the next boot.
+- **Dismounting a busy volume.** `volumeserial` dismounts a volume it cannot lock,
+  which is the only way to write to one with open handles. Anything holding a
+  file on it will see that handle fail. `-NoVolumeDismount` makes it refuse
+  rather than dismount.
+
+## Known gaps
+
+Not skips so much as work that is not done yet:
+
+- **GPT partition GUIDs.** Only the disk GUID is changed. Partition GUIDs are
+  referenced by both the boot configuration and `MountedDevices`, so rewriting
+  them means recomputing the GPT header and partition-array CRCs and fixing up
+  both consumers.
+- **Extension blocks in EDID.** Only block 0 is rewritten and re-checksummed;
+  CTA-861 extension blocks are left exactly as they were.
 
 ## What this is not
 
