@@ -328,9 +328,18 @@ function Show-ModuleChecklist {
     Write-Host '  ------------------------------------------------------------------------' -ForegroundColor DarkGray
     Write-Host ('   {0} of {1} selected' -f $count, $Provider.Count) -ForegroundColor Cyan
     Write-Host ''
-    Write-Host '   Toggle : numbers or names, e.g. "1 4 7" or "mac volumeserial"' -ForegroundColor DarkGray
-    Write-Host '   a all   n none   s standard   d advanced   r risky   i invert' -ForegroundColor DarkGray
-    Write-Host '   Enter to run the ticked modules, q to cancel' -ForegroundColor DarkGray
+    Write-Host '   Change the selection : numbers or names, e.g. "1 4 7" or "mac volumeserial"' -ForegroundColor DarkGray
+    Write-Host '                          a all   n none   s standard   d advanced   r risky   i invert' -ForegroundColor DarkGray
+    Write-Host '   Cancel               : q' -ForegroundColor DarkGray
+    Write-Host ''
+
+    if ($count -gt 0) {
+        Write-Host '   >>> ' -ForegroundColor Green -NoNewline
+        Write-Host 'Happy with the list? Press ENTER on its own to run it.' -ForegroundColor White
+    } else {
+        Write-Host '   >>> ' -ForegroundColor Yellow -NoNewline
+        Write-Host 'Nothing is ticked. Tick something, or press q to cancel.' -ForegroundColor White
+    }
 }
 
 function Select-SpooferModuleInteractive {
@@ -354,7 +363,16 @@ function Select-SpooferModuleInteractive {
     while ($true) {
         Show-ModuleChecklist -Provider $Provider -Selected $selected
 
-        $input_ = (Read-Host '   >').Trim()
+        $selectedCount = @($Provider | Where-Object { $selected[$_.Name] }).Count
+        $prompt = if ($selectedCount -gt 0) {
+            '   [ENTER = run {0} module(s)]' -f $selectedCount
+        } else {
+            '   [nothing ticked]'
+        }
+
+        $answer = Read-Host $prompt
+        if ($null -eq $answer) { return $null }
+        $input_ = $answer.Trim()
 
         if ($input_ -eq '') {
             $chosen = @($Provider | Where-Object { $selected[$_.Name] })
