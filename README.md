@@ -39,6 +39,10 @@ would be redirected into `WOW6432Node` and would silently miss the real values.
 git clone https://github.com/ard37880/Spoofer.git
 cd Spoofer
 
+# Windows blocks unsigned scripts by default. This allows them for this window
+# only; it dies with the shell and changes nothing machine-wide.
+Set-ExecutionPolicy -Scope Process -Bypass -Force
+
 # Look before you leap: reads only, no elevation needed for most of it.
 .\Spoofer.ps1 -Action Status
 
@@ -52,8 +56,18 @@ cd Spoofer
 .\Spoofer.ps1 -Action Spoof
 ```
 
-`Spoofer.cmd` is there if you would rather double-click; it forwards its
-arguments and bypasses the execution policy for that one process only.
+Skip the `Set-ExecutionPolicy` line and you get
+`cannot be loaded because running scripts is disabled on this system`. If you
+would rather not set it at all, `Spoofer.cmd` does the same thing per process
+and forwards its arguments through:
+
+```
+Spoofer.cmd -Action Status
+```
+
+Downloading the repository as a ZIP rather than cloning it adds a second
+hurdle: Windows marks the extracted files as blocked and PowerShell refuses to
+load the modules. `Get-ChildItem -Recurse | Unblock-File` clears it.
 
 ### Choosing what to change
 
