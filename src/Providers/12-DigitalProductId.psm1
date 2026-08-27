@@ -58,16 +58,20 @@ function Get-DigitalProductIdTarget {
 
     foreach ($name in @('DigitalProductId', 'DigitalProductId4')) {
         $path = $script:CurrentVersion
-        $valueName = $name
+
+        # Computed here rather than inside the generator. A closure made with
+        # GetNewClosure is bound to a new dynamic module that cannot see this
+        # module's private functions, so calling New-SpoofedProductIdBlob from
+        # inside one fails with "not recognized". The closure captures the
+        # finished value instead.
+        $current  = (Get-SpooferRegistryValue -Path $path -Name $name).Value
+        $newValue = New-SpoofedProductIdBlob -Current ([byte[]]$current)
 
         [void]$targets.Add(
-            (New-SpooferRegistryTarget -Path $path -Name $valueName -Kind 'Binary' `
-                -Label $valueName -TakeOwnership `
+            (New-SpooferRegistryTarget -Path $path -Name $name -Kind 'Binary' `
+                -Label $name -TakeOwnership `
                 -Note 'activation may need to be re-run' `
-                -Generator ({
-                    $current = (Get-SpooferRegistryValue -Path $path -Name $valueName).Value
-                    New-SpoofedProductIdBlob -Current ([byte[]]$current)
-                }.GetNewClosure()))
+                -Generator ({ $newValue }.GetNewClosure()))
         )
     }
 

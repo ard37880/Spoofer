@@ -44,11 +44,13 @@ Re-run `-Action Status` after a few days if it matters to you.
 Four things a hardware ID tool usually declines to touch. All of them run by
 default here, each with the work that makes it safe:
 
-- **The MBR signature of a boot disk.** The boot configuration references it by
-  value, so `diskid` exports the boot store into the backup with
-  `bcdedit /export`, changes the signature, and rewrites the boot entries with
+- **The identifier of a boot disk, GPT and MBR alike.** The BCD device element
+  carries the disk identity, so changing either one leaves the boot entries
+  pointing at a disk that no longer answers to that name and the machine stops
+  at `0xc000000e`. `diskid` exports the boot store into the backup with
+  `bcdedit /export`, changes the identifier, and rewrites the boot entries with
   `bcdboot`. If the export fails the disk is left alone; if the repair fails the
-  signature is put straight back and the store re-imported. On a total failure
+  identifier is put straight back and the store re-imported. On a total failure
   the exact recovery commands are printed. **A restart is the only real proof
   that a repaired boot configuration works - keep the backup until the machine
   has booted once.**
@@ -104,6 +106,11 @@ default here, each with the work that makes it safe:
 - **Drive letters can move.** Changing a GPT disk GUID does not disturb the
   `MountedDevices` mappings, which key on partition GUIDs. Changing an MBR
   signature on a data disk can, so its letters may be reassigned on the next boot.
+- **The system volume's GUID.** `volumeguid` renames every `\??\Volume{...}`
+  entry in `MountedDevices` except the one whose mapping data matches the
+  `\DosDevices` entry for the system drive. The mount manager resolves the boot
+  volume through that name early in startup, and one identifier left alone is a
+  far better outcome than a machine that will not start.
 - **Dismounting a busy volume.** `volumeserial` dismounts a volume it cannot lock,
   which is the only way to write to one with open handles. Anything holding a
   file on it will see that handle fail. `-NoVolumeDismount` makes it refuse
@@ -113,10 +120,6 @@ default here, each with the work that makes it safe:
 
 Not skips so much as work that is not done yet:
 
-- **GPT partition GUIDs.** Only the disk GUID is changed. Partition GUIDs are
-  referenced by both the boot configuration and `MountedDevices`, so rewriting
-  them means recomputing the GPT header and partition-array CRCs and fixing up
-  both consumers.
 - **Extension blocks in EDID.** Only block 0 is rewritten and re-checksummed;
   CTA-861 extension blocks are left exactly as they were.
 - **GPT partition GUIDs.** The parsing and checksum half is written and tested

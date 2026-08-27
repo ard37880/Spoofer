@@ -968,6 +968,42 @@ Describe-Group 'GPT structures' {
     }
 }
 
+Describe-Group 'Generator scope' {
+
+    # A generator built with GetNewClosure is rebound to a fresh dynamic module,
+    # which does not carry the defining module's private functions. Calling one
+    # from inside a closure fails at spoof time with "not recognized", which is
+    # how digitalproductid shipped broken while every other check passed.
+
+    Test-Case 'No closure generator calls a private module function' {
+        $files = @(Get-ChildItem -LiteralPath (Join-Path $sourceDir 'Providers') -Filter '*.psm1' -File)
+
+        foreach ($file in $files) {
+            $text = Get-Content -LiteralPath $file.FullName -Raw
+            $ast  = [System.Management.Automation.Language.Parser]::ParseInput($text, [ref]$null, [ref]$null)
+
+            # Every function this module defines but does not export is private,
+            # so a closure cannot reach it.
+            $defined = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
+                ForEach-Object { $_.Name })
+
+            foreach ($block in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.ScriptBlockExpressionAst] }, $true)) {
+                $following = $text.Substring($block.Extent.EndOffset, [math]::Min(20, $text.Length - $block.Extent.EndOffset))
+                if ($following -notmatch '^\s*\.GetNewClosure\(\)') { continue }
+
+                $called = @($block.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true) |
+                    ForEach-Object { $_.GetCommandName() } |
+                    Where-Object { $_ })
+
+                foreach ($name in $called) {
+                    Assert-True ($defined -notcontains $name) `
+                        "$($file.Name): a GetNewClosure generator calls '$name', which is private to the module and will not resolve inside the closure"
+                }
+            }
+        }
+    }
+}
+
 Describe-Group 'Verification checks' {
 
     Test-Case 'Every check is completely specified' {

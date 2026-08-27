@@ -6,12 +6,14 @@
     number burned into the drive's firmware - that one is not writable from user
     mode at all. See docs/limitations.md.
 
-    Changing the MBR signature of the disk Windows boots from is handled rather
-    than avoided. The boot configuration references that signature by value, so
-    the store is exported to the backup first, the signature is changed, and
-    bcdboot then rewrites the boot entries against the new one. If any part of
-    that fails the signature is put straight back and the store re-imported, so
-    the disk never sits in a state where the boot entries disagree with it.
+    Changing the identifier of the disk Windows boots from is handled rather
+    than avoided, and that applies to GPT and MBR alike. The BCD device element
+    carries the disk identity, so either one leaves the boot entries pointing at
+    a disk that no longer answers to that name. The store is exported to the
+    backup first, the identifier is changed, and bcdboot then rewrites the boot
+    entries against the new one. If any part of that fails the identifier is put
+    straight back and the store re-imported, so the disk never sits in a state
+    where the boot entries disagree with it.
 .NOTES
     A reboot is the only real test of a repaired boot configuration.
 #>
@@ -50,10 +52,14 @@ function Get-SpooferDisk {
             Guid           = [string]$disk.Guid
             Signature      = $disk.Signature
             IsBootCritical = $isBootCritical
-            # Only an MBR boot disk needs the boot configuration repaired
-            # afterwards: GPT boot entries reference partition GUIDs, which this
-            # provider does not touch.
-            NeedsBcdRepair = ($disk.PartitionStyle -eq 'MBR' -and $isBootCritical)
+            # Any boot disk needs the boot configuration repaired afterwards,
+            # GPT included. The BCD device element carries the disk identity
+            # alongside the partition, so changing a GPT disk GUID leaves the
+            # boot entries pointing at a disk that no longer answers to that
+            # name and the machine stops at 0xc000000e. An earlier version of
+            # this module assumed only MBR signatures mattered and made a test
+            # machine unbootable.
+            NeedsBcdRepair = [bool]$isBootCritical
             IsReadOnly     = [bool]$disk.IsReadOnly
         }
     }
@@ -213,9 +219,8 @@ function Get-SpooferProviderDefinition {
                 $value = if ($disk.PartitionStyle -eq 'GPT') { $disk.Guid } else { '0x{0:X8}' -f $disk.Signature }
 
                 $note = $disk.PartitionStyle
-                if ($disk.NeedsBcdRepair)      { $note += ', boot disk - boot config will be rewritten' }
-                elseif ($disk.IsBootCritical)  { $note += ', boot disk' }
-                if ($disk.IsReadOnly)          { $note += ', read-only' }
+                if ($disk.NeedsBcdRepair) { $note += ', boot disk - boot config will be rewritten' }
+                if ($disk.IsReadOnly)     { $note += ', read-only' }
 
                 [pscustomobject]@{
                     Item  = 'Disk {0} [{1}]' -f $disk.Number, $disk.FriendlyName
@@ -258,7 +263,7 @@ function Get-SpooferProviderDefinition {
                 if ($Context.DryRun) {
                     Write-SpooferChange -Label $label -OldValue $oldValue -NewValue $newValue -Simulated
                     if ($disk.NeedsBcdRepair) {
-                        Write-SpooferLog -Level Info -Message "Disk $($disk.Number) is the MBR boot disk; the boot configuration would be exported and rewritten with bcdboot."
+                        Write-SpooferLog -Level Info -Message "Disk $($disk.Number) is the boot disk; the boot configuration would be exported and rewritten with bcdboot."
                     }
                     [void]$results.Add([pscustomobject]@{
                         Label = $label; OldValue = $oldValue; NewValue = $newValue
@@ -270,7 +275,7 @@ function Get-SpooferProviderDefinition {
                 $bcdExportPath = $null
 
                 if ($disk.NeedsBcdRepair) {
-                    Write-SpooferLog -Level Warn -Message "Disk $($disk.Number) is the MBR boot disk. Exporting the boot configuration before touching its signature."
+                    Write-SpooferLog -Level Warn -Message "Disk $($disk.Number) is the boot disk. Exporting the boot configuration before touching its identifier."
                     try {
                         $fileName      = 'bcd-disk{0}.bcd' -f $disk.Number
                         $bcdExportPath = New-SpooferBackupFilePath -Session $Session -Name $fileName

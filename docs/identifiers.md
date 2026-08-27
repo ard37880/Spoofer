@@ -115,12 +115,17 @@ Virtual adapters are excluded by default; `-IncludeVirtualAdapters` includes the
 | Partition style | Value |
 |---|---|
 | GPT | Disk GUID (`Set-Disk -Guid`) |
-| MBR | Disk signature (`Set-Disk -Signature`), non-boot disks only |
+| MBR | Disk signature (`Set-Disk -Signature`) |
 
-Written in the partition table, not the drive firmware. MBR boot disks are
-skipped: the boot configuration references the signature by value, so changing it
-leaves the machine unbootable. GPT boot entries reference *partition* GUIDs, which
-this does not touch, so a GPT disk GUID is safe to rewrite.
+Written in the partition table, not the drive firmware.
+
+Boot disks are included, and both styles need the same care. The BCD device
+element carries the disk identity, so changing either a GPT disk GUID or an MBR
+signature leaves the boot entries pointing at a disk that no longer answers to
+that name, and the machine stops at `0xc000000e`. The boot store is exported
+into the backup first, the identifier is changed, and `bcdboot` rewrites the
+entries against the new one; if any of that fails the identifier is put straight
+back and the store re-imported.
 
 On restore the disk's recorded serial is checked first, so an identifier is never
 written onto whatever now happens to hold that disk number.
