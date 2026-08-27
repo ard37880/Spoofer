@@ -97,6 +97,18 @@ Downloading the repository as a ZIP rather than cloning it adds a second
 hurdle: Windows marks the extracted files as blocked and PowerShell refuses to
 load the modules. `Get-ChildItem -Recurse | Unblock-File` clears it.
 
+Every run prints the version it is running as its first line:
+
+```
+  Build     : 2026.08.27 (e551def)
+```
+
+Worth a glance before reporting anything that looks like a bug. An old copy
+looks exactly like a current one from the inside, and a ZIP extracted next to
+a clone is easy to run by accident. The commit in brackets is only there when
+the directory is a git checkout; the version on its own comes from the
+`VERSION` file, which travels with the ZIP.
+
 ### Choosing what to change
 
 `-Interactive` prints a checklist you can toggle before anything happens:

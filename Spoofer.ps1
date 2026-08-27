@@ -229,10 +229,46 @@ function Show-Header {
     Write-Host '  Every change is backed up first and can be reverted with -Action Restore.' -ForegroundColor DarkGray
 }
 
+function Get-SpooferBuild {
+    <#
+    .SYNOPSIS
+        A string identifying the code that is actually running.
+    .DESCRIPTION
+        An old copy looks exactly like a current one from the inside, and a ZIP
+        download has no git metadata to tell them apart. The VERSION file
+        travels with the ZIP, so it answers the question either way; the commit
+        is added on top when the checkout has one.
+    #>
+    $build = '<unknown>'
+
+    # Nothing here is allowed to stop a run. A banner that throws would be a
+    # worse bug than the one it exists to diagnose.
+    try {
+        $here = $PSScriptRoot
+        if ([string]::IsNullOrEmpty($here)) { $here = (Get-Location).Path }
+
+        $versionFile = Join-Path $here 'VERSION'
+        if (Test-Path -LiteralPath $versionFile) {
+            $build = (Get-Content -LiteralPath $versionFile -Raw).Trim()
+        }
+
+        if (Test-Path -LiteralPath (Join-Path $here '.git')) {
+            $sha = & git -C $here rev-parse --short HEAD 2>$null
+            if ($LASTEXITCODE -eq 0 -and $sha) { $build = '{0} ({1})' -f $build, ([string]$sha).Trim() }
+        }
+    } catch {
+        # No git on PATH, or an unreadable directory. Whatever was worked out
+        # before the failure is still more useful than nothing.
+    }
+
+    return $build
+}
+
 function Show-Environment {
     $os = Get-SpooferOsInfo
 
     Write-Host ''
+    Write-Host ('  Build     : {0}' -f (Get-SpooferBuild)) -ForegroundColor DarkGray
     Write-Host ('  Host      : {0}' -f [System.Environment]::MachineName) -ForegroundColor DarkGray
     Write-Host ('  OS        : {0} (build {1})' -f $os.Caption, $os.Build) -ForegroundColor DarkGray
     Write-Host ('  PowerShell: {0} ({1}-bit)' -f $PSVersionTable.PSVersion, $(if (Test-SpooferProcess64Bit) { 64 } else { 32 })) -ForegroundColor DarkGray
