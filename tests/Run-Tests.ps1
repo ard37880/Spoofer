@@ -565,6 +565,72 @@ Describe-Group 'Provider command resolution' {
     }
 }
 
+Describe-Group 'Array returns' {
+
+    # PowerShell unrolls a single-element array as it leaves a function, so a
+    # caller that does not wrap gets a bare object. Under StrictMode on Windows
+    # PowerShell 5.1, .Count on that object throws, which is how a crash shipped
+    # on the only platform this tool targets while every test passed on 7.x.
+    # The rule is that the caller wraps, since that is what the rest of the code
+    # already assumes.
+
+    Test-Case 'A wrapped single-module selection counts as one' {
+        $one = @(Get-SpooferProvider -Name @('machineguid'))
+        Assert-True ($one -is [array]) "expected an array, got $($one.GetType().Name)"
+        Assert-Equal 1 $one.Count
+        Assert-Equal 'machineguid' $one[0].Name
+    }
+
+    Test-Case 'Wrapping does not nest an already-plural result' {
+        $two = @(Get-SpooferProvider -Name @('machineguid', 'mac'))
+        Assert-Equal 2 $two.Count
+        Assert-True ($two[0] -isnot [array]) 'the elements must be providers, not arrays'
+    }
+
+    Test-Case 'A tier holding one module still counts as one' {
+        foreach ($tier in @('Standard', 'Advanced', 'Risky')) {
+            $byTier = @(Get-SpooferProvider -Tier @($tier))
+            Assert-True ($byTier.Count -ge 1) "$tier tier came back empty"
+            Assert-True ($byTier[0] -isnot [array]) "$tier tier nested its results"
+        }
+    }
+
+    Test-Case 'A backup store holding one session counts as one' {
+        $groupRoot = Join-Path $sandbox 'arrays'
+        $outerRoot = $env:SPOOFER_ROOT
+        $env:SPOOFER_ROOT = $groupRoot
+        Initialize-SpooferRoot | Out-Null
+
+        try {
+            Assert-Equal 0 @(Get-SpooferBackupSession -IncludeRestored).Count
+
+            $session = New-SpooferBackupSession -Modules @('mac')
+            Add-SpooferBackupEntry -Session $session -Type 'Stub' -Label 'x' -Data @{ Value = 1 } | Out-Null
+            Save-SpooferBackupSession -Session $session | Out-Null
+
+            Assert-Equal 1 @(Get-SpooferBackupSession -IncludeRestored).Count
+            Assert-Equal $session.Id (Resolve-SpooferBackupSession -Id 'latest').Id 'one session must resolve to itself, not to a list'
+        } finally {
+            $env:SPOOFER_ROOT = $outerRoot
+        }
+    }
+
+    Test-Case 'The provider selection call sites wrap their result' {
+        # The precise regression. A broader sweep for this shape was tried and
+        # dropped: it cannot see function boundaries, so unrelated locals that
+        # happen to share a name collide and it reports work that is fine.
+        $text = Get-Content -LiteralPath (Join-Path $root 'Spoofer.ps1')
+
+        $assignments = @($text | Where-Object { $_ -match '^\s*\$providers\s*=' })
+        Assert-True ($assignments.Count -ge 2) 'expected the status and spoof call sites'
+
+        foreach ($line in $assignments) {
+            Assert-Match '^\s*\$providers\s*=\s*@\(' $line `
+                "unwrapped provider assignment, which unrolls to a bare object and breaks .Count on PowerShell 5.1: $($line.Trim())"
+        }
+    }
+}
+
 Describe-Group 'Provider context' {
 
     Test-Case 'Options are read back with their defaults' {
