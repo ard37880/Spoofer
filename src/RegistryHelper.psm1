@@ -327,6 +327,60 @@ function Grant-SpooferRegistryAccess {
 
 #region Writing
 
+function Copy-SpooferRegistryKey {
+    <#
+    .SYNOPSIS
+        Copies a registry key and everything under it to a new name.
+    .DESCRIPTION
+        The registry has no rename. Identifiers that live in a key *name* rather
+        than in a value, such as a network profile GUID, are changed by copying
+        the subtree to the new name and deleting the original.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$Destination
+    )
+
+    $from = Resolve-SpooferRegistryPath -Path $Source
+    $to   = Resolve-SpooferRegistryPath -Path $Destination
+
+    if (-not (Test-Path -LiteralPath $from)) { throw "Registry key '$Source' does not exist." }
+    if (Test-Path -LiteralPath $to)          { throw "Registry key '$Destination' already exists." }
+
+    New-Item -Path $to -Force -ErrorAction Stop | Out-Null
+
+    $key = Get-Item -LiteralPath $from -ErrorAction Stop
+    foreach ($name in $key.GetValueNames()) {
+        $kind = [string]$key.GetValueKind($name)
+        if ($kind -eq 'Unknown' -or $kind -eq 'None') { $kind = 'Binary' }
+
+        $value = $key.GetValue($name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        New-ItemProperty -Path $to -Name $name -Value $value -PropertyType $kind -Force -ErrorAction Stop | Out-Null
+    }
+
+    foreach ($child in (Get-ChildItem -LiteralPath $from -ErrorAction SilentlyContinue)) {
+        Copy-SpooferRegistryKey -Source ('{0}\{1}' -f $Source, $child.PSChildName) `
+                                -Destination ('{0}\{1}' -f $Destination, $child.PSChildName)
+    }
+}
+
+function Remove-SpooferRegistryKey {
+    <#
+    .SYNOPSIS
+        Deletes a key and everything under it, if it is there.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    $resolved = Resolve-SpooferRegistryPath -Path $Path
+    if (Test-Path -LiteralPath $resolved) {
+        Remove-Item -LiteralPath $resolved -Recurse -Force -ErrorAction Stop
+    }
+}
+
 function Backup-SpooferRegistryValue {
     <#
     .SYNOPSIS
@@ -554,6 +608,8 @@ Export-ModuleMember -Function @(
     'ConvertTo-SpooferRegistryPayload'
     'ConvertFrom-SpooferRegistryPayload'
     'Grant-SpooferRegistryAccess'
+    'Copy-SpooferRegistryKey'
+    'Remove-SpooferRegistryKey'
     'Backup-SpooferRegistryValue'
     'Set-SpooferRegistryValue'
 )
