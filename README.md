@@ -41,7 +41,7 @@ cd Spoofer
 
 # Windows blocks unsigned scripts by default. This allows them for this window
 # only; it dies with the shell and changes nothing machine-wide.
-Set-ExecutionPolicy -Scope Process -Bypass -Force
+Set-ExecutionPolicy Bypass -Scope Process -Force
 
 # Look before you leap: reads only, no elevation needed for most of it.
 .\Spoofer.ps1 -Action Status
