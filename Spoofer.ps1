@@ -768,7 +768,7 @@ function Invoke-StatusAction {
         Enable-SpooferPrivilegeSet | Out-Null
     }
 
-    $providers = Get-SelectedProvider -AllowInteractive
+    $providers = @(Get-SelectedProvider -AllowInteractive)
     if ($providers.Count -eq 0) { return }
 
     foreach ($provider in $providers) {
@@ -856,7 +856,7 @@ function Invoke-VerifyAction {
 function Invoke-SpoofAction {
     Test-Environment -RequireAdmin:(-not $DryRun)
 
-    $providers = Get-SelectedProvider -AllowInteractive
+    $providers = @(Get-SelectedProvider -AllowInteractive)
     if ($providers.Count -eq 0) { return }
 
     Initialize-SpooferRandom -Seed $Seed
