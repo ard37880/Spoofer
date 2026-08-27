@@ -120,6 +120,33 @@ Not skips so much as work that is not done yet:
 - **Extension blocks in EDID.** Only block 0 is rewritten and re-checksummed;
   CTA-861 extension blocks are left exactly as they were.
 
+## Browser fingerprinting
+
+The `browser` module clears cookies, local and session storage, IndexedDB and
+service workers. Those are the identifiers a site *stored on your machine*, and
+clearing them genuinely resets that half.
+
+It does not touch the browser's fingerprint, which is the other half and the
+harder one:
+
+- the canvas and WebGL hashes, which come from how your GPU and drivers
+  rasterise a test image
+- the WebGL renderer string, which names your graphics card
+- the installed font list, enumerated by measuring text
+- screen geometry, colour depth and device pixel ratio
+- the AudioContext signature
+- the TLS handshake shape (JA3), fixed before any HTTP is sent
+
+None of those are files on disk, so no system tool moves them. They are
+properties of the browser and the machine it runs on, and changing them is the
+browser's job: Tor Browser, Firefox with `privacy.resistFingerprinting`, or
+Brave's per-site randomisation.
+
+Randomising badly is worse than not randomising. A machine presenting a fresh
+unique canvas hash on every visit is itself a rare and memorable signal, which
+is why Tor aims for every user looking identical rather than every user looking
+different.
+
 ## What this is not
 
 This changes reported identity. It is not an anti-cheat bypass, it does not hide
