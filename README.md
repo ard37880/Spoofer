@@ -142,6 +142,7 @@ Run `.\Spoofer.ps1 -Action Modules` for the current list with full detail.
 | `digitalproductid` | Risky | The `DigitalProductId` blobs - the binary form of the installed product key |
 | `volumeserial` | Risky | The `XXXX-XXXX` serial in every volume's boot record, NTFS backup sectors and exFAT checksums included |
 | `browser` | Risky | Cookies, local and session storage, IndexedDB and service workers, for every browser profile |
+| `interfaceguid` | Risky | The GUID of each network adapter, in all five places Windows records it (needs a restart) |
 
 Tiers describe blast radius, not effectiveness:
 
@@ -281,6 +282,7 @@ Spoofer.cmd              elevating launcher
 src/
   Common.psm1            logging, environment probes, identifier generation
   Verify.psm1            reported versus authoritative comparison
+  Gpt.psm1               GUID partition table parsing and checksums
   Native.psm1            P/Invoke: token privileges, locked boot-sector I/O
   BackupStore.psm1       backup sessions and the restore dispatcher
   RegistryHelper.psm1    registry read/write with automatic backup

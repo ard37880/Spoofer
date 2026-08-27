@@ -567,6 +567,27 @@ Register-SpooferRestoreHandler -Type 'Registry' -Handler {
     return "Restored $($Entry.Name)."
 }
 
+Register-SpooferRestoreHandler -Type 'RegistryKeyRename' -Handler {
+    param($Entry)
+
+    $originalPath = '{0}\{1}' -f $Entry.Parent, $Entry.OriginalName
+    $newPath      = '{0}\{1}' -f $Entry.Parent, $Entry.NewName
+
+    # Copy back before deleting, so the key is never absent from both names.
+    if (-not (Test-Path -LiteralPath (Resolve-SpooferRegistryPath -Path $originalPath))) {
+        if (-not (Test-Path -LiteralPath (Resolve-SpooferRegistryPath -Path $newPath))) {
+            throw "Neither '$originalPath' nor '$newPath' is present; the key cannot be put back."
+        }
+        Copy-SpooferRegistryKey -Source $newPath -Destination $originalPath
+    }
+
+    if ($Entry.NewName -ne $Entry.OriginalName) {
+        Remove-SpooferRegistryKey -Path $newPath
+    }
+
+    return "Renamed $($Entry.NewName) back to $($Entry.OriginalName)."
+}
+
 Register-SpooferRestoreHandler -Type 'RegistryAcl' -Handler {
     param($Entry)
 
