@@ -136,9 +136,12 @@ Run `.\Spoofer.ps1 -Action Modules` for the current list with full detail.
 | `mac` | Advanced | A locally administered MAC address on each physical adapter |
 | `diskid` | Advanced | GPT disk GUID, or the MBR signature - boot disks included, with the boot configuration rewritten to match |
 | `edid` | Advanced | The serial in each cached monitor EDID, checksum recomputed |
+| `volumeguid` | Advanced | The `\\?\Volume{...}` GUID of every volume, leaving drive letters alone |
+| `networkprofile` | Advanced | Network profile GUIDs, and with them the record of every network joined |
 | `productid` | Risky | The Windows `ProductId` string |
 | `digitalproductid` | Risky | The `DigitalProductId` blobs - the binary form of the installed product key |
 | `volumeserial` | Risky | The `XXXX-XXXX` serial in every volume's boot record, NTFS backup sectors and exFAT checksums included |
+| `browser` | Risky | Cookies, local and session storage, IndexedDB and service workers, for every browser profile |
 
 Tiers describe blast radius, not effectiveness:
 

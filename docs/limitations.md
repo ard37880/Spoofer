@@ -119,6 +119,15 @@ Not skips so much as work that is not done yet:
   both consumers.
 - **Extension blocks in EDID.** Only block 0 is rewritten and re-checksummed;
   CTA-861 extension blocks are left exactly as they were.
+- **Network interface GUIDs.** Each adapter has a GUID appearing in its class key
+  as `NetCfgInstanceId`, as a sub-key of `Tcpip\Parameters\Interfaces`, under
+  `Control\Network`, and in several service configurations. It is a genuine
+  per-machine identifier and it is writable, but every reference has to change
+  together, and one missed reference leaves the adapter with no working TCP/IP
+  binding. Left alone rather than half done.
+- **The machine SID.** Changing it breaks local accounts, profiles and any domain
+  membership. Sysinternals withdrew NewSID over exactly this; the supported
+  answer is sysprep on a fresh image, not an in-place edit.
 
 ## Browser fingerprinting
 
