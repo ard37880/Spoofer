@@ -204,8 +204,9 @@ function Get-SpooferProviderDefinition {
         Title          = 'Disk GUID / MBR signature'
         Tier           = 'Advanced'
         RequiresReboot = $false
-        Description    = 'Rewrites the GPT disk GUID or the MBR disk signature on every disk. On an MBR boot disk the boot configuration is exported first and rewritten with bcdboot afterwards, and both are rolled back together if the repair fails.'
-        Targets        = @('Partition table of every initialised disk', 'Boot configuration data store, on an MBR boot disk')
+        TouchesBoot    = $true
+        Description    = 'Rewrites the GPT disk GUID or the MBR disk signature on every disk. On a boot disk of either style the boot configuration is exported first and rewritten with bcdboot afterwards, and both are rolled back together if the repair fails.'
+        Targets        = @('Partition table of every initialised disk', 'Boot configuration data store, on a boot disk')
 
         GetState = {
             param($Context)

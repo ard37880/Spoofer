@@ -62,6 +62,7 @@ function Import-SpooferProvider {
                 # otherwise land in this function's output stream alongside the
                 # catalogue itself.
                 Confirm-SpooferProviderDefinition -Definition $definition -Source $file.Name | Out-Null
+                Add-SpooferProviderDefault -Definition $definition
                 [void]$catalogue.Add($definition)
             }
             Write-SpooferLog -Level Debug -Message "Loaded provider module $($file.Name)."
@@ -79,6 +80,33 @@ function Import-SpooferProvider {
 
     $script:Providers = @($catalogue)
     return $script:Providers
+}
+
+function Add-SpooferProviderDefault {
+    <#
+    .SYNOPSIS
+        Fills in the optional descriptor properties.
+    .DESCRIPTION
+        StrictMode turns a missing property into an error, so without this every
+        consumer would have to test for these before reading them. Defaulting
+        them once at load time keeps that out of the checklist and the status
+        table, and means a new provider only declares what is true of it.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$Definition
+    )
+
+    $defaults = @{
+        RequiresReboot = $false
+        TouchesBoot    = $false
+        Targets        = @()
+    }
+
+    foreach ($name in $defaults.Keys) {
+        if ($Definition.PSObject.Properties.Name -contains $name) { continue }
+        Add-Member -InputObject $Definition -MemberType NoteProperty -Name $name -Value $defaults[$name]
+    }
 }
 
 function Confirm-SpooferProviderDefinition {
@@ -175,6 +203,7 @@ function Get-SpooferProviderName {
 Export-ModuleMember -Function @(
     'Import-SpooferProvider'
     'Confirm-SpooferProviderDefinition'
+    'Add-SpooferProviderDefault'
     'Get-SpooferProvider'
     'Get-SpooferProviderName'
 )

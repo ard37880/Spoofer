@@ -97,7 +97,8 @@ function Get-SpooferProviderDefinition {
         Title          = 'Volume GUIDs'
         Tier           = 'Advanced'
         RequiresReboot = $true
-        Description    = 'Gives every volume a new \\?\Volume{...} GUID in HKLM\SYSTEM\MountedDevices. Drive letters are left alone, so C: stays C:. Takes effect after a restart.'
+        TouchesBoot    = $true
+        Description    = 'Gives every volume a new \\?\Volume{...} GUID in HKLM\SYSTEM\MountedDevices, except the system volume, which the mount manager resolves the boot volume through. Drive letters are left alone, so C: stays C:. Takes effect after a restart.'
         Targets        = @('HKLM\SYSTEM\MountedDevices\\??\Volume{*}')
 
         GetState = {
