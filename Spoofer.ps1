@@ -85,7 +85,7 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet('Menu', 'Status', 'Spoof', 'Restore', 'List', 'Remove', 'Modules')]
+    [ValidateSet('Menu', 'Status', 'Verify', 'Spoof', 'Restore', 'List', 'Remove', 'Modules')]
     [string]$Action = 'Menu',
 
     [switch]$Interactive,
@@ -141,7 +141,7 @@ Get-Module |
     Where-Object { $_.Path -and $_.Path.StartsWith($modulePath, [System.StringComparison]::OrdinalIgnoreCase) } |
     Remove-Module -Force
 
-foreach ($name in @('Common', 'Native', 'BackupStore', 'RegistryHelper', 'ProviderCommon', 'ProviderRegistry')) {
+foreach ($name in @('Common', 'Native', 'BackupStore', 'RegistryHelper', 'ProviderCommon', 'ProviderRegistry', 'Verify')) {
     Import-Module (Join-Path $modulePath "$name.psm1") -DisableNameChecking
 }
 
@@ -550,24 +550,28 @@ function Show-SpooferMainMenu {
     Write-Host '        What this machine currently reports. Changes nothing.' -ForegroundColor DarkGray
     Write-Host ''
     Write-Host '   2.' -ForegroundColor Cyan -NoNewline
+    Write-Host '  Check what is actually hidden' -ForegroundColor White
+    Write-Host '        Compares what Windows reports against what the hardware says.' -ForegroundColor DarkGray
+    Write-Host ''
+    Write-Host '   3.' -ForegroundColor Cyan -NoNewline
     Write-Host '  Preview a change' -ForegroundColor White
     Write-Host '        Shows exactly what would change. Still writes nothing.' -ForegroundColor DarkGray
     Write-Host ''
-    Write-Host '   3.' -ForegroundColor Cyan -NoNewline
+    Write-Host '   4.' -ForegroundColor Cyan -NoNewline
     Write-Host '  Change identifiers' -ForegroundColor White
     Write-Host '        Pick which ones from a checklist, then apply. Backed up first.' -ForegroundColor DarkGray
     Write-Host ''
-    Write-Host '   4.' -ForegroundColor Cyan -NoNewline
+    Write-Host '   5.' -ForegroundColor Cyan -NoNewline
     Write-Host '  Undo a change' -ForegroundColor White
     Write-Host '        Put the original values back from a backup.' -ForegroundColor DarkGray
     Write-Host ''
-    Write-Host '   5.' -ForegroundColor Cyan -NoNewline
+    Write-Host '   6.' -ForegroundColor Cyan -NoNewline
     Write-Host '  List backups' -ForegroundColor White
     Write-Host ''
-    Write-Host '   6.' -ForegroundColor Cyan -NoNewline
+    Write-Host '   7.' -ForegroundColor Cyan -NoNewline
     Write-Host '  Explain the modules' -ForegroundColor White
     Write-Host ''
-    Write-Host '   7.' -ForegroundColor Cyan -NoNewline
+    Write-Host '   8.' -ForegroundColor Cyan -NoNewline
     Write-Host '  Delete a backup' -ForegroundColor White
     Write-Host ''
     Write-Host '   0.' -ForegroundColor DarkGray -NoNewline
@@ -656,7 +660,7 @@ function Invoke-MenuAction {
     while ($true) {
         Show-SpooferMainMenu
 
-        $choice = Read-SpooferMenuChoice -Key @('0', '1', '2', '3', '4', '5', '6', '7')
+        $choice = Read-SpooferMenuChoice -Key @('0', '1', '2', '3', '4', '5', '6', '7', '8')
         if ($null -eq $choice -or $choice -eq '0') {
             Write-Host ''
             Write-SpooferLog -Level Info -Message 'Done.'
@@ -674,6 +678,11 @@ function Invoke-MenuAction {
                 }
 
                 '2' {
+                    Invoke-VerifyAction
+                    Wait-SpooferAcknowledge
+                }
+
+                '3' {
                     # A preview still picks its modules, so the checklist runs first.
                     $script:Interactive = $true
                     $script:DryRun      = $true
@@ -682,14 +691,14 @@ function Invoke-MenuAction {
                     Wait-SpooferAcknowledge
                 }
 
-                '3' {
+                '4' {
                     $script:Interactive = $true
                     $script:DryRun      = $false
                     Invoke-SpoofAction
                     Wait-SpooferAcknowledge
                 }
 
-                '4' {
+                '5' {
                     $session = Select-SpooferBackupInteractive -Title 'Which backup would you like to undo?'
                     if ($session) {
                         $script:BackupId = $session.Id
@@ -700,17 +709,17 @@ function Invoke-MenuAction {
                     }
                 }
 
-                '5' {
+                '6' {
                     Invoke-ListAction
                     Wait-SpooferAcknowledge
                 }
 
-                '6' {
+                '7' {
                     Invoke-ModulesAction
                     Wait-SpooferAcknowledge
                 }
 
-                '7' {
+                '8' {
                     $session = Select-SpooferBackupInteractive -Title 'Which backup would you like to delete?'
                     if ($session) {
                         $script:BackupId = $session.Id
@@ -770,6 +779,60 @@ function Invoke-StatusAction {
         }
     }
 
+    Write-Host ''
+}
+
+function Invoke-VerifyAction {
+    <#
+    .SYNOPSIS
+        Prints what Windows reports beside what the hardware says.
+    #>
+    Test-Environment
+
+    $results = @(Invoke-SpooferCheck)
+    $lastGroup = ''
+
+    foreach ($row in $results) {
+        if ($row.Group -ne $lastGroup) {
+            Write-SpooferBanner -Text $row.Group
+            $lastGroup = $row.Group
+        }
+
+        Write-Host ('    {0,-34} ' -f $row.Item) -ForegroundColor Gray -NoNewline
+        Write-Host ('{0,-40}' -f (ConvertTo-SpooferDisplayValue -Value $row.Reported -MaxLength 38)) -ForegroundColor White -NoNewline
+
+        switch ($row.Coverage) {
+            'Full' {
+                Write-Host 'covered' -ForegroundColor Green
+            }
+            'CacheOnly' {
+                if ($row.Match -eq $false) {
+                    Write-Host 'cache only' -ForegroundColor Yellow
+                    Write-Host ('    {0,-34} ' -f '') -NoNewline
+                    Write-Host ('{0,-40}' -f (ConvertTo-SpooferDisplayValue -Value $row.Authoritative -MaxLength 38)) -ForegroundColor DarkYellow -NoNewline
+                    Write-Host 'what the hardware says' -ForegroundColor DarkYellow
+                } else {
+                    Write-Host 'cache only, unchanged' -ForegroundColor DarkGray
+                }
+            }
+            'None' {
+                Write-Host 'not covered' -ForegroundColor Red
+            }
+        }
+    }
+
+    $full      = @($results | Where-Object { $_.Coverage -eq 'Full' }).Count
+    $leaking   = @($results | Where-Object { $_.Coverage -eq 'CacheOnly' -and $_.Match -eq $false }).Count
+    $uncovered = @($results | Where-Object { $_.Coverage -eq 'None' }).Count
+
+    Write-SpooferBanner -Text 'Summary'
+    Write-Host ('    {0,-12} {1} values this tool fully controls' -f 'covered', $full) -ForegroundColor Green
+    Write-Host ('    {0,-12} {1} values where the cache and the hardware now disagree' -f 'cache only', $leaking) -ForegroundColor Yellow
+    Write-Host ('    {0,-12} {1} values read straight from hardware, never touched' -f 'not covered', $uncovered) -ForegroundColor Red
+    Write-Host ''
+    Write-Host '    A caller that goes to the firmware or the driver instead of the' -ForegroundColor DarkGray
+    Write-Host '    registry sees the second and third groups as they really are.' -ForegroundColor DarkGray
+    Write-Host '    docs/limitations.md explains why each one cannot be changed.' -ForegroundColor DarkGray
     Write-Host ''
 }
 
@@ -988,7 +1051,7 @@ try {
 
 Show-Header
 
-if ($Action -in @('Menu', 'Status', 'Spoof')) { Show-Environment }
+if ($Action -in @('Menu', 'Status', 'Verify', 'Spoof')) { Show-Environment }
 
 Write-SpooferLog -Level Debug -NoConsole -Message ("Invoked: -Action {0} -Module '{1}' -DryRun:{2} -Force:{3}" -f $Action, ($Module -join ','), $DryRun, $Force)
 
@@ -1008,6 +1071,7 @@ try {
     switch ($Action) {
         'Menu'    { Invoke-MenuAction }
         'Status'  { Invoke-StatusAction }
+        'Verify'  { Invoke-VerifyAction }
         'Spoof'   { Invoke-SpoofAction }
         'Restore' { Invoke-RestoreAction }
         'List'    { Invoke-ListAction }

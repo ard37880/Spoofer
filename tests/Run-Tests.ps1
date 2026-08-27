@@ -34,7 +34,7 @@ Get-Module |
     Where-Object { $_.Path -and $_.Path.StartsWith($sourceDir, [System.StringComparison]::OrdinalIgnoreCase) } |
     Remove-Module -Force
 
-foreach ($name in @('Common', 'Native', 'BackupStore', 'RegistryHelper', 'ProviderCommon', 'ProviderRegistry')) {
+foreach ($name in @('Common', 'Native', 'BackupStore', 'RegistryHelper', 'ProviderCommon', 'ProviderRegistry', 'Verify')) {
     Import-Module (Join-Path $sourceDir "$name.psm1") -DisableNameChecking
 }
 
@@ -767,6 +767,73 @@ Describe-Group 'Module selection checklist' {
 
     Test-Case 'Selection order follows the catalogue, not the order typed' {
         Assert-Equal 'machineguid,mac' (Invoke-Picker -Keystrokes @('n', 'mac machineguid', '') -PreSelected $null)
+    }
+}
+
+Describe-Group 'Verification checks' {
+
+    Test-Case 'Every check is completely specified' {
+        foreach ($check in (Get-SpooferCheck)) {
+            Assert-True ($check.Group.Length -gt 0) 'a check needs a group'
+            Assert-True ($check.Item.Length -gt 0)  'a check needs an item'
+            Assert-True (@('Full', 'CacheOnly', 'None') -contains $check.Coverage) "unknown coverage '$($check.Coverage)' on $($check.Item)"
+            Assert-True ($check.Reported -is [scriptblock]) "$($check.Item) must know how to read itself"
+        }
+    }
+
+    Test-Case 'A CacheOnly check has something to compare against' {
+        # The whole point of that classification is the second read. Without it
+        # the row could never show a gap and would be quietly meaningless.
+        foreach ($check in (Get-SpooferCheck | Where-Object { $_.Coverage -eq 'CacheOnly' })) {
+            Assert-True ($check.Authoritative -is [scriptblock]) "$($check.Item) is CacheOnly but has no authoritative read"
+        }
+    }
+
+    Test-Case 'Full and None checks name no second source' {
+        foreach ($check in (Get-SpooferCheck | Where-Object { $_.Coverage -ne 'CacheOnly' })) {
+            Assert-True ($null -eq $check.Authoritative) "$($check.Item) is $($check.Coverage) but declares an authoritative read"
+        }
+    }
+
+    Test-Case 'The things that cannot be changed are all listed' {
+        $items = @(Get-SpooferCheck | Where-Object { $_.Coverage -eq 'None' } | ForEach-Object { $_.Item })
+        foreach ($expected in @('Motherboard UUID', 'CPU identifier', 'TPM', 'GPU')) {
+            Assert-True ($items -contains $expected) "'$expected' should be reported as not covered"
+        }
+    }
+
+    Test-Case 'Every covered check names the module responsible' {
+        foreach ($check in (Get-SpooferCheck | Where-Object { $_.Coverage -ne 'None' })) {
+            Assert-True ($check.Module.Length -gt 0) "$($check.Item) does not say which module covers it"
+        }
+
+        $known = @(Get-SpooferProviderName)
+        foreach ($check in (Get-SpooferCheck | Where-Object { $_.Module })) {
+            Assert-True ($known -contains $check.Module) "$($check.Item) names module '$($check.Module)', which does not exist"
+        }
+    }
+
+    Test-Case 'A malformed coverage value is rejected at declaration' {
+        Assert-Throws { New-SpooferCheck -Group 'g' -Item 'i' -Coverage 'Nonsense' -Reported {} }
+    }
+
+    Test-Case 'Reads that throw are reported, not fatal' {
+        # Nearly every check calls a Windows-only cmdlet, so on any other
+        # platform they all throw. Invoke-SpooferCheck has to survive that and
+        # still return a row per check.
+        $results = @(Invoke-SpooferCheck 6>$null)
+        Assert-True ($results.Count -gt 0) 'checks should still produce rows'
+
+        foreach ($row in $results) {
+            Assert-True ($row.Reported.Length -gt 0) "$($row.Item) produced no reported value"
+            Assert-True (@('Full', 'CacheOnly', 'None') -contains $row.Coverage)
+        }
+    }
+
+    Test-Case 'Match is left undecided when there is nothing to compare' {
+        foreach ($row in (Invoke-SpooferCheck 6>$null | Where-Object { $_.Coverage -ne 'CacheOnly' })) {
+            Assert-Equal $null $row.Match "$($row.Item) should not claim a comparison it did not make"
+        }
     }
 }
 

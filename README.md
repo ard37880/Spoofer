@@ -13,12 +13,13 @@ administrator rights and then puts up a menu:
 
 ```
    1.  Show current identifiers
-   2.  Preview a change
-   3.  Change identifiers
-   4.  Undo a change
-   5.  List backups
-   6.  Explain the modules
-   7.  Delete a backup
+   2.  Check what is actually hidden
+   3.  Preview a change
+   4.  Change identifiers
+   5.  Undo a change
+   6.  List backups
+   7.  Explain the modules
+   8.  Delete a backup
    0.  Exit
 ```
 
@@ -28,6 +29,7 @@ from the command line instead.
 ```powershell
 .\Spoofer.ps1                                    # the menu
 .\Spoofer.ps1 -Action Status                     # what the identifiers are now
+.\Spoofer.ps1 -Action Verify                     # what is actually hidden, and what is not
 .\Spoofer.ps1 -Action Spoof -DryRun              # what would change
 .\Spoofer.ps1 -Action Spoof                      # change everything
 .\Spoofer.ps1 -Action Spoof -Interactive         # tick what to change
@@ -151,7 +153,7 @@ lets you tick individual modules.
 ## Usage
 
 ```
-.\Spoofer.ps1 [-Action <Menu|Status|Spoof|Restore|List|Remove|Modules>]
+.\Spoofer.ps1 [-Action <Menu|Status|Verify|Spoof|Restore|List|Remove|Modules>]
               [-Interactive]
               [-Module <names>] [-Exclude <names>]
               [-Tier <Standard|Advanced|Risky>] [-SafeOnly]
@@ -168,6 +170,7 @@ lets you tick individual modules.
 |---|---|
 | `Menu` | Interactive menu. The default when no action is given. |
 | `Status` | Prints the current value of every identifier. |
+| `Verify` | Compares what Windows reports against what the hardware says. |
 | `Spoof` | Backs up, then changes, the selected identifiers. |
 | `Restore` | Replays a backup session, putting the original values back. |
 | `List` | Lists stored backups and whether each has been restored. |
@@ -239,7 +242,21 @@ value stayed changed. `docs/identifiers.md` maps every value the tool touches to
 where it lives and what reads it.
 
 In short: this changes what Windows *reports*. It does not reflash firmware, and
-it does not touch anything a kernel driver reads directly from hardware.
+it does not touch anything read directly from hardware.
+
+`-Action Verify` shows you exactly where that line falls on your machine. It
+runs both reads and sorts every value into three buckets:
+
+```
+covered       this tool controls the value completely
+cache only    the registry copy was rewritten, but the firmware or the driver
+              still returns the original, and both are printed
+not covered   read straight from hardware, never touched
+```
+
+The clearest example is a network adapter: after a spoof, `MacAddress` is the
+new one and `PermanentAddress` is still the address burned into the card. Any
+caller that asks NDIS for the permanent address gets the real one.
 
 Two things are worth knowing before a full run:
 
@@ -271,6 +288,7 @@ Spoofer.ps1              command line entry point
 Spoofer.cmd              elevating launcher
 src/
   Common.psm1            logging, environment probes, identifier generation
+  Verify.psm1            reported versus authoritative comparison
   Native.psm1            P/Invoke: token privileges, locked boot-sector I/O
   BackupStore.psm1       backup sessions and the restore dispatcher
   RegistryHelper.psm1    registry read/write with automatic backup
