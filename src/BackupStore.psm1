@@ -115,6 +115,57 @@ function New-SpooferBackupSession {
     return $session
 }
 
+function ConvertTo-SpooferJsonSafeValue {
+    <#
+    .SYNOPSIS
+        Strips PowerShell's object decoration so a value survives the manifest.
+    .DESCRIPTION
+        Provider cmdlets hand back primitives wrapped in a PSObject carrying note
+        properties: Get-Content adds PSPath, PSParentPath, PSChildName, PSDrive,
+        PSProvider and ReadCount to every string it returns.
+
+        Windows PowerShell 5.1 serialises those note properties, so a decorated
+        string is written to the manifest as an object and comes back as one,
+        which then gets written to disk in place of the value it was standing in
+        for. PowerShell 7 serialises the same value as a plain string, so the
+        difference only shows up on the version this tool actually targets.
+
+        Unwrapping to the base object here means a provider cannot introduce the
+        problem no matter where it sourced its value.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [object]$Value
+    )
+
+    if ($null -eq $Value) { return $null }
+
+    # The .psobject intrinsic reaches the wrapper itself. Calling BaseObject on
+    # the value directly does not work: PowerShell unwraps it first and then
+    # looks the property up on the string, which does not have one.
+    $Value = $Value.psobject.BaseObject
+    if ($null -eq $Value) { return $null }
+
+    # Strings and byte arrays are enumerable but must stay whole. The byte array
+    # is returned with a leading comma: returning one bare would be unrolled by
+    # the pipeline and arrive as an Object[] of boxed bytes.
+    if ($Value -is [string]) { return $Value }
+    if ($Value -is [byte[]]) { return ,$Value }
+
+    if ($Value -is [System.Collections.IDictionary]) {
+        $copy = [ordered]@{}
+        foreach ($key in $Value.Keys) { $copy[$key] = ConvertTo-SpooferJsonSafeValue -Value $Value[$key] }
+        return $copy
+    }
+
+    if ($Value -is [System.Collections.IEnumerable]) {
+        return ,@(foreach ($item in $Value) { ConvertTo-SpooferJsonSafeValue -Value $item })
+    }
+
+    return $Value
+}
+
 function Add-SpooferBackupEntry {
     <#
     .SYNOPSIS
@@ -124,9 +175,11 @@ function Add-SpooferBackupEntry {
     .PARAMETER Label
         Human-readable name shown in listings and restore output.
     .PARAMETER Data
-        Type-specific payload. Must contain only JSON-safe values: strings,
+        Type-specific payload. Should contain only JSON-safe values: strings,
         numbers, booleans, nulls, and arrays of those. Binary data belongs in a
-        base64 string or a sidecar file.
+        base64 string or a sidecar file. Values are unwrapped to their base
+        object on the way in, so a string carrying provider note properties is
+        stored as the string it is.
     #>
     [CmdletBinding()]
     param(
@@ -151,7 +204,7 @@ function Add-SpooferBackupEntry {
         Module    = $Module
         StampUtc  = [DateTime]::UtcNow.ToString('o')
     }
-    foreach ($key in $Data.Keys) { $entry[$key] = $Data[$key] }
+    foreach ($key in $Data.Keys) { $entry[$key] = ConvertTo-SpooferJsonSafeValue -Value $Data[$key] }
 
     [void]$Session.Entries.Add([pscustomobject]$entry)
     Write-SpooferLog -Level Debug -Message "Backup entry added: [$Type] $Label"
@@ -488,6 +541,7 @@ function Restore-SpooferBackupSession {
 #endregion
 
 Export-ModuleMember -Function @(
+    'ConvertTo-SpooferJsonSafeValue'
     'Register-SpooferRestoreHandler'
     'Get-SpooferRestoreHandler'
     'Get-SpooferRegisteredRestoreType'

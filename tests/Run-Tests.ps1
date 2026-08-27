@@ -248,6 +248,57 @@ Describe-Group 'Backup sessions' {
         for ($i = 0; $i -lt $bytes.Length; $i++) { Assert-Equal $bytes[$i] $restored[$i] }
     }
 
+    Test-Case 'Values carrying provider note properties are stored plainly' {
+        # Get-Content and friends return primitives wrapped in a PSObject with
+        # PSPath, PSChildName and the rest attached. Windows PowerShell 5.1
+        # serialises those note properties into the manifest, so the value comes
+        # back as an object; PowerShell 7 does not, which is why this asserts on
+        # the stored entry rather than on a JSON round trip.
+        $decorated = 'original-value' |
+            Add-Member -NotePropertyName 'PSPath'      -NotePropertyValue 'C:\somewhere\file.txt' -PassThru |
+            Add-Member -NotePropertyName 'PSChildName' -NotePropertyValue 'file.txt' -PassThru |
+            Add-Member -NotePropertyName 'ReadCount'   -NotePropertyValue 1 -PassThru
+
+        Assert-True (@($decorated | Get-Member -MemberType NoteProperty).Count -gt 0) 'the fixture itself must be decorated'
+
+        $session = New-SpooferBackupSession -Modules @('probe')
+        $entry = Add-SpooferBackupEntry -Session $session -Type 'Stub' -Module 'probe' -Label 'decorated' -Data @{
+            Value = $decorated
+        }
+
+        Assert-Equal 'original-value' $entry.Value
+        Assert-Equal 0 (@($entry.Value | Get-Member -MemberType NoteProperty).Count) 'the decoration must not reach the manifest'
+    }
+
+    Test-Case 'Normalisation reaches inside arrays and nested maps' {
+        $decorated = 'inner' | Add-Member -NotePropertyName 'PSPath' -NotePropertyValue 'C:\x' -PassThru
+
+        $session = New-SpooferBackupSession -Modules @('probe')
+        $entry = Add-SpooferBackupEntry -Session $session -Type 'Stub' -Module 'probe' -Label 'nested' -Data @{
+            Items  = @($decorated, 'plain')
+            Nested = @{ Deep = $decorated }
+        }
+
+        Assert-Equal 0 (@($entry.Items[0] | Get-Member -MemberType NoteProperty).Count)
+        Assert-Equal 'inner' $entry.Items[0]
+        Assert-Equal 'plain' $entry.Items[1]
+        Assert-Equal 0 (@($entry.Nested.Deep | Get-Member -MemberType NoteProperty).Count)
+        Assert-Equal 'inner' $entry.Nested.Deep
+    }
+
+    Test-Case 'Normalisation leaves ordinary values alone' {
+        Assert-Equal $null   (ConvertTo-SpooferJsonSafeValue -Value $null)
+        Assert-Equal 'text'  (ConvertTo-SpooferJsonSafeValue -Value 'text')
+        Assert-Equal 42      (ConvertTo-SpooferJsonSafeValue -Value 42)
+        Assert-Equal $true   (ConvertTo-SpooferJsonSafeValue -Value $true)
+
+        # Byte arrays are enumerable but must not be taken apart.
+        $bytes = ConvertTo-SpooferJsonSafeValue -Value ([byte[]](1, 2, 250))
+        Assert-True ($bytes -is [byte[]]) "expected a byte[] but got $($bytes.GetType().Name)"
+        Assert-Equal 3 $bytes.Length
+        Assert-Equal 250 $bytes[2]
+    }
+
     Test-Case 'An empty session writes nothing to disk' {
         $session = New-SpooferBackupSession
         Assert-Equal $null (Save-SpooferBackupSession -Session $session)
