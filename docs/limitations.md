@@ -106,6 +106,13 @@ default here, each with the work that makes it safe:
 - **Drive letters can move.** Changing a GPT disk GUID does not disturb the
   `MountedDevices` mappings, which key on partition GUIDs. Changing an MBR
   signature on a data disk can, so its letters may be reassigned on the next boot.
+- **An interface rename that cannot finish.** An adapter's GUID appears in five
+  registry keys and they all have to agree. `interfaceguid` draws a GUID no key
+  is using, renames the references, and writes the class key last, so until the
+  last write the adapter is still on its old GUID. If a rename fails part way
+  the keys that did move go straight back, and the backup entries for them are
+  dropped so a later restore does not undo them twice. A key that will not go
+  back is reported and keeps its entry.
 - **The system volume's GUID.** `volumeguid` renames every `\??\Volume{...}`
   entry in `MountedDevices` except the one whose mapping data matches the
   `\DosDevices` entry for the system drive. The mount manager resolves the boot

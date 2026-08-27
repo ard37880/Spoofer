@@ -1441,6 +1441,140 @@ Describe-Group 'Digital product id' {
     }
 }
 
+Describe-Group 'Interface rename rollback' {
+
+    # The provider is loaded on its own so its private rollback helpers can be
+    # reached, and the registry calls inside them are replaced with a hashtable
+    # standing in for the keys. That is enough to exercise the logic on a
+    # machine that has no registry at all.
+    $interfaceModule = Import-Module (Join-Path $sourceDir 'Providers/17-NetworkInterface.psm1') -Force -PassThru -DisableNameChecking
+
+    $installFakes = {
+        param($Keys, $FailOn)
+
+        $script:FakeKeys   = $Keys
+        $script:FakeFailOn = $FailOn
+
+        function script:Resolve-SpooferRegistryPath { param([string]$Path) return $Path }
+
+        function script:Test-Path {
+            param([string]$Path, [string]$LiteralPath)
+            $target = if ($LiteralPath) { $LiteralPath } else { $Path }
+            return $script:FakeKeys.ContainsKey($target)
+        }
+
+        function script:Copy-SpooferRegistryKey {
+            param([string]$Source, [string]$Destination)
+            if ($Destination -eq $script:FakeFailOn) { throw "cannot create '$Destination'" }
+            $script:FakeKeys[$Destination] = $script:FakeKeys[$Source]
+        }
+
+        function script:Remove-SpooferRegistryKey {
+            param([string]$Path)
+            if ($Path -eq $script:FakeFailOn) { throw "cannot remove '$Path'" }
+            $script:FakeKeys.Remove($Path)
+        }
+    }
+
+    Test-Case 'Every completed rename goes back to the name it had' {
+        $keys = @{ 'P\new-a' = 'a'; 'P\new-b' = 'b' }
+        & $interfaceModule $installFakes $keys $null
+
+        $completed = @(
+            [pscustomobject]@{ Purpose = 'TCP/IP settings';   Original = 'P\old-a'; New = 'P\new-a'; Entry = $null }
+            [pscustomobject]@{ Purpose = 'TCP/IPv6 settings'; Original = 'P\old-b'; New = 'P\new-b'; Entry = $null }
+        )
+
+        $result = & $interfaceModule { param($c) Undo-SpooferInterfaceRename -Completed $c } $completed
+
+        Assert-Equal 0 $result.Stuck
+        Assert-Equal 2 @($result.Undone).Count
+        Assert-True ($keys.ContainsKey('P\old-a') -and $keys.ContainsKey('P\old-b')) 'both keys should be back under their original names'
+        Assert-True (-not $keys.ContainsKey('P\new-a') -and -not $keys.ContainsKey('P\new-b')) 'neither new name should still be there'
+    }
+
+    Test-Case 'A step that will not go back is counted rather than thrown' {
+        $keys = @{ 'P\new-a' = 'a'; 'P\new-b' = 'b' }
+        & $interfaceModule $installFakes $keys 'P\new-b'
+
+        $completed = @(
+            [pscustomobject]@{ Purpose = 'TCP/IP settings'; Original = 'P\old-a'; New = 'P\new-a'; Entry = $null }
+            [pscustomobject]@{ Purpose = 'network setup';   Original = 'P\old-b'; New = 'P\new-b'; Entry = $null }
+        )
+
+        $result = & $interfaceModule { param($c) Undo-SpooferInterfaceRename -Completed $c } $completed
+
+        # The stuck one must not stop the rest from being put back.
+        Assert-Equal 1 $result.Stuck
+        Assert-Equal 1 @($result.Undone).Count
+        Assert-True ($keys.ContainsKey('P\old-a')) 'the step that could go back should have gone back'
+    }
+
+    Test-Case 'Only the renames that went back lose their backup entry' {
+        $keys = @{ 'P\new-a' = 'a'; 'P\new-b' = 'b' }
+        & $interfaceModule $installFakes $keys 'P\new-b'
+
+        $session = [pscustomobject]@{ Entries = (New-Object System.Collections.ArrayList) }
+        $entryA  = [pscustomobject]@{ Label = 'a' }
+        $entryB  = [pscustomobject]@{ Label = 'b' }
+        [void]$session.Entries.Add($entryA)
+        [void]$session.Entries.Add($entryB)
+
+        $completed = @(
+            [pscustomobject]@{ Purpose = 'TCP/IP settings'; Original = 'P\old-a'; New = 'P\new-a'; Entry = $entryA }
+            [pscustomobject]@{ Purpose = 'network setup';   Original = 'P\old-b'; New = 'P\new-b'; Entry = $entryB }
+        )
+
+        $reason = & $interfaceModule {
+            param($c, $s)
+            Complete-SpooferInterfaceRollback -Completed $c -Label 'Interface Test' -Because 'boom' -Session $s
+        } $completed $session
+
+        Assert-True ($reason -like '*rollback incomplete*') "expected the reason to report an incomplete rollback, got '$reason'"
+        Assert-Equal 1 $session.Entries.Count
+        Assert-True ([object]::ReferenceEquals($session.Entries[0], $entryB)) 'the entry left behind should be the one that is still on the new name'
+    }
+
+    Test-Case 'A clean rollback drops every entry and says so' {
+        $keys = @{ 'P\new-a' = 'a' }
+        & $interfaceModule $installFakes $keys $null
+
+        $session = [pscustomobject]@{ Entries = (New-Object System.Collections.ArrayList) }
+        $entryA  = [pscustomobject]@{ Label = 'a' }
+        [void]$session.Entries.Add($entryA)
+
+        $completed = @(
+            [pscustomobject]@{ Purpose = 'TCP/IP settings'; Original = 'P\old-a'; New = 'P\new-a'; Entry = $entryA }
+        )
+
+        $reason = & $interfaceModule {
+            param($c, $s)
+            Complete-SpooferInterfaceRollback -Completed $c -Label 'Interface Test' -Because 'boom' -Session $s
+        } $completed $session
+
+        Assert-True ($reason -like '*rolled back*') "expected the reason to report a completed rollback, got '$reason'"
+        Assert-True ($reason -notlike '*incomplete*') "a clean rollback should not be reported as incomplete, got '$reason'"
+        Assert-Equal 0 $session.Entries.Count
+    }
+
+    Test-Case 'A GUID already naming a key is never handed out' {
+        $keys = @{}
+        & $interfaceModule $installFakes $keys $null
+
+        $guid = & $interfaceModule { New-SpooferFreeInterfaceGuid }
+        Assert-True ($guid -match '^\{[0-9a-fA-F-]{36}\}$') "expected a brace-form GUID, got '$guid'"
+
+        # Every candidate now collides, which is the case that used to leave an
+        # adapter with its references split across two names.
+        & $interfaceModule { function script:Test-Path { param([string]$Path, [string]$LiteralPath) return $true } }
+
+        $blocked = & $interfaceModule { New-SpooferFreeInterfaceGuid -Attempts 3 }
+        Assert-Equal $null $blocked
+    }
+
+    Remove-Module -ModuleInfo $interfaceModule -Force
+}
+
 Describe-Group 'Environment probes' {
 
     Test-Case 'Windows detection agrees with the host' {
