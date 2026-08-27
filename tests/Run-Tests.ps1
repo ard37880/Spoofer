@@ -513,6 +513,45 @@ Describe-Group 'Provider catalogue' {
     }
 }
 
+Describe-Group 'Provider descriptor defaults' {
+
+    # Every consumer reads these without guarding for them, which StrictMode
+    # would otherwise make an error the moment a provider left one out.
+    Test-Case 'Every provider carries the optional properties' {
+        foreach ($provider in @(Get-SpooferProvider)) {
+            foreach ($name in @('RequiresReboot', 'TouchesBoot', 'Targets')) {
+                Assert-True ($provider.PSObject.Properties.Name -contains $name) `
+                    "provider '$($provider.Name)' has no $name property"
+            }
+        }
+    }
+
+    Test-Case 'A descriptor that declares them keeps its own values' {
+        $definition = [pscustomobject]@{
+            Name = 'x'; RequiresReboot = $true; TouchesBoot = $true; Targets = @('a')
+        }
+        Add-SpooferProviderDefault -Definition $definition
+
+        Assert-Equal $true $definition.RequiresReboot
+        Assert-Equal $true $definition.TouchesBoot
+        Assert-Equal 'a'   ($definition.Targets -join ',')
+    }
+
+    Test-Case 'A descriptor that omits them gets the safe values' {
+        $definition = [pscustomobject]@{ Name = 'x' }
+        Add-SpooferProviderDefault -Definition $definition
+
+        Assert-Equal $false $definition.RequiresReboot
+        Assert-Equal $false $definition.TouchesBoot
+        Assert-Equal 0      @($definition.Targets).Count
+    }
+
+    Test-Case 'The boot flag is set on the modules that rewrite boot state' {
+        $flagged = @(Get-SpooferProvider | Where-Object { $_.TouchesBoot } | ForEach-Object { $_.Name } | Sort-Object)
+        Assert-Equal 'diskid,volumeguid' ($flagged -join ',')
+    }
+}
+
 Describe-Group 'Provider command resolution' {
 
     # Provider scriptblocks run in their own module's session state, and a module
@@ -833,6 +872,19 @@ Describe-Group 'Module selection checklist' {
 
     Test-Case 'Selection order follows the catalogue, not the order typed' {
         Assert-Equal 'machineguid,mac' (Invoke-Picker -Keystrokes @('n', 'mac machineguid', '') -PreSelected $null)
+    }
+
+    Test-Case 'b unticks the modules that can stop the machine starting' {
+        $boot = @($catalogue | Where-Object { $_.TouchesBoot } | ForEach-Object { $_.Name })
+        Assert-True ($boot.Count -gt 0) 'expected at least one provider to be marked as touching boot'
+
+        $rest = ((@($catalogue | Where-Object { -not $_.TouchesBoot }) | ForEach-Object { $_.Name }) -join ',')
+        Assert-Equal $rest (Invoke-Picker -Keystrokes @('a', 'b', '') -PreSelected $null)
+    }
+
+    Test-Case 'b leaves the rest of the selection where it was' {
+        # Only the boot ones come off; it is not another way of spelling 'none'.
+        Assert-Equal 'machineguid' (Invoke-Picker -Keystrokes @('n', 'machineguid', 'b', '') -PreSelected $null)
     }
 }
 

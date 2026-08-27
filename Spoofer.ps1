@@ -320,7 +320,16 @@ function Show-ModuleChecklist {
         Write-Host ('   {0,2}. [{1}] ' -f ($i + 1), $tick) -ForegroundColor $(if ($Selected[$item.Name]) { 'Green' } else { 'DarkGray' }) -NoNewline
         Write-Host ('{0,-18}' -f $item.Name) -ForegroundColor White -NoNewline
         Write-Host ('{0,-10}' -f $item.Tier) -ForegroundColor $colour -NoNewline
-        Write-Host ('{0}{1}' -f $item.Title, $(if ($item.RequiresReboot) { '  (restart required)' } else { '' })) -ForegroundColor DarkGray
+        # The tier says how disruptive a module is, not whether it can stop the
+        # machine starting. Those are different questions, and the second one is
+        # the one worth seeing before pressing ENTER. The title is only padded
+        # out to the marker column when there is a marker to line up.
+        $title = if ($item.TouchesBoot -or $item.RequiresReboot) { '{0,-42}' -f $item.Title } else { $item.Title }
+        Write-Host $title -ForegroundColor DarkGray -NoNewline
+
+        if ($item.TouchesBoot)    { Write-Host ' boot'    -ForegroundColor Red    -NoNewline }
+        if ($item.RequiresReboot) { Write-Host ' restart' -ForegroundColor Yellow -NoNewline }
+        Write-Host ''
     }
 
     $count = @($Selected.Keys | Where-Object { $Selected[$_] }).Count
@@ -330,7 +339,12 @@ function Show-ModuleChecklist {
     Write-Host ''
     Write-Host '   Change the selection : numbers or names, e.g. "1 4 7" or "mac volumeserial"' -ForegroundColor DarkGray
     Write-Host '                          a all   n none   s standard   d advanced   r risky   i invert' -ForegroundColor DarkGray
+    Write-Host '                          b untick everything marked boot' -ForegroundColor DarkGray
     Write-Host '   Cancel               : q' -ForegroundColor DarkGray
+    Write-Host ''
+    Write-Host '   boot' -ForegroundColor Red -NoNewline
+    Write-Host ' rewrites something the machine needs to start. Backed up and repaired,' -ForegroundColor DarkGray
+    Write-Host '        but a restart is the only real proof it worked.' -ForegroundColor DarkGray
     Write-Host ''
 
     if ($count -gt 0) {
@@ -410,6 +424,12 @@ function Select-SpooferModuleInteractive {
         }
         if ($input_ -match '^(r|risky)$') {
             foreach ($item in $Provider) { $selected[$item.Name] = ($item.Tier -eq 'Risky') }
+            continue
+        }
+        if ($input_ -match '^(b|boot)$') {
+            foreach ($item in $Provider) {
+                if ($item.TouchesBoot) { $selected[$item.Name] = $false }
+            }
             continue
         }
 

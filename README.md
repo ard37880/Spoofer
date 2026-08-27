@@ -106,15 +106,23 @@ load the modules. `Get-ChildItem -Recurse | Unblock-File` clears it.
    1. [x] machineguid       Standard  Cryptography MachineGuid
    2. [x] machineid         Standard  Secondary machine identifiers
    ...
-  12. [x] digitalproductid  Risky     Digital product id
+  10. [x] diskid            Advanced  Disk GUID / MBR signature                  boot
   13. [x] edid              Advanced  Monitor EDID serials
+  14. [x] volumeguid        Advanced  Volume GUIDs                               boot restart
 
-   13 of 13 selected
+   17 of 17 selected
 
    Toggle : numbers or names, e.g. "1 4 7" or "mac volumeserial"
    a all   n none   s standard   d advanced   r risky   i invert
+   b untick everything marked boot
    Enter to run the ticked modules, q to cancel
 ```
+
+A module marked **boot** rewrites something the machine needs in order to
+start. Both are backed up and repaired as they go, but a restart is the only
+real proof that worked, so `b` is there to take them off the list on a machine
+you cannot afford to reinstall. **restart** just means the change lands on the
+next boot.
 
 The same choices are available non-interactively: `-Module` to name them,
 `-Exclude` to drop some, `-Tier` to pick a tier, and `-SafeOnly` for everything
@@ -150,6 +158,10 @@ Tiers describe blast radius, not effectiveness:
 - **Advanced** - touches devices or the partition table, or needs a restart.
 - **Risky** - can disturb software licensing or activation, or writes raw disk
   sectors.
+
+The tier is not the same question as whether a module can stop the machine
+starting. `diskid` and `volumeguid` are the two that can, and the checklist
+marks them **boot** whatever their tier.
 
 All three run by default. `-SafeOnly` leaves out the Risky tier; `-Interactive`
 lets you tick individual modules.
