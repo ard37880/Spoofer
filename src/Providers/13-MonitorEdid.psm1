@@ -196,15 +196,16 @@ function Get-SpooferEdidTarget {
             if (-not (Test-EdidBlob -Edid ([byte[]]$current.Value))) { continue }
 
             $label = 'EDID {0} ({1})' -f $monitor.PSChildName, $instance.PSChildName
-            $targetPath = $path
+
+            # Built here, not inside the generator: GetNewClosure binds the
+            # scriptblock to a new dynamic module that cannot see this module's
+            # private functions, so New-SpoofedEdid would not resolve there.
+            $newValue = New-SpoofedEdid -Current ([byte[]]$current.Value)
 
             [void]$targets.Add(
-                (New-SpooferRegistryTarget -Path $targetPath -Name 'EDID' -Kind 'Binary' `
+                (New-SpooferRegistryTarget -Path $path -Name 'EDID' -Kind 'Binary' `
                     -Label $label -TakeOwnership `
-                    -Generator ({
-                        $value = (Get-SpooferRegistryValue -Path $targetPath -Name 'EDID').Value
-                        New-SpoofedEdid -Current ([byte[]]$value)
-                    }.GetNewClosure()))
+                    -Generator ({ $newValue }.GetNewClosure()))
             )
         }
     }

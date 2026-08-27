@@ -136,7 +136,7 @@ Run `.\Spoofer.ps1 -Action Modules` for the current list with full detail.
 | `mac` | Advanced | A locally administered MAC address on each physical adapter |
 | `diskid` | Advanced | GPT disk GUID, or the MBR signature - boot disks included, with the boot configuration rewritten to match |
 | `edid` | Advanced | The serial in each cached monitor EDID, checksum recomputed |
-| `volumeguid` | Advanced | The `\\?\Volume{...}` GUID of every volume, leaving drive letters alone |
+| `volumeguid` | Advanced | The `\\?\Volume{...}` GUID of every volume except the system one, leaving drive letters alone |
 | `networkprofile` | Advanced | Network profile GUIDs, and with them the record of every network joined |
 | `productid` | Risky | The Windows `ProductId` string |
 | `digitalproductid` | Risky | The `DigitalProductId` blobs - the binary form of the installed product key |
@@ -263,10 +263,11 @@ caller that asks NDIS for the permanent address gets the real one.
 
 Two things are worth knowing before a full run:
 
-- **The MBR boot disk.** Its signature is referenced by the boot configuration.
-  `diskid` exports the boot store, changes the signature, and rewrites the boot
-  entries with `bcdboot`; if any of that fails, the signature goes straight back
-  and the store is re-imported. A restart is still the only real proof.
+- **The boot disk.** Its identifier is referenced by the boot configuration,
+  whether the disk is GPT or MBR. `diskid` exports the boot store, changes the
+  identifier, and rewrites the boot entries with `bcdboot`; if any of that
+  fails, the identifier goes straight back and the store is re-imported. A
+  restart is still the only real proof.
 - **The system volume's serial.** Windows will not let the volume it is running
   from be locked, so the write is attempted and reported honestly rather than
   skipped silently. Boot from Windows PE and run the same command there and it

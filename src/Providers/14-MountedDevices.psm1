@@ -8,9 +8,9 @@
     value name rather than the data, so changing it means writing the data under
     a new name and removing the old one.
 
-    Only the Volume entries are touched. The DosDevices entries are matched on
-    their data, so leaving them alone keeps drive letters where they are while
-    the GUIDs underneath change.
+    Only the Volume entries are touched, and the system volume's is skipped
+    outright. The DosDevices entries are matched on their data, so leaving them
+    alone keeps drive letters where they are while the GUIDs underneath change.
 .NOTES
     Software that recorded a path as \\?\Volume{...} rather than as a drive
     letter will not find it afterwards. That is rare outside backup and imaging
@@ -39,13 +39,37 @@ function Get-SpooferMountedVolume {
     $key = Get-Item -LiteralPath $path -ErrorAction SilentlyContinue
     if ($null -eq $key) { return @() }
 
+    # The system volume's entry is identified by matching its mapping data
+    # against the \DosDevices entry for the system drive letter. Renaming it is
+    # not worth the risk: the mount manager resolves the boot volume through
+    # these names early in startup, and a machine that will not boot is a far
+    # worse outcome than one identifier left alone.
+    $systemData = $null
+    if ($env:SystemDrive) {
+        $systemName = '\DosDevices\{0}' -f $env:SystemDrive.ToUpperInvariant()
+        if ($key.GetValueNames() -contains $systemName) {
+            $systemData = [byte[]]$key.GetValue($systemName)
+        }
+    }
+
     foreach ($name in $key.GetValueNames()) {
         if ($name -notmatch '^\\\?\?\\Volume\{([0-9a-fA-F-]{36})\}$') { continue }
 
+        $data = [byte[]]$key.GetValue($name)
+
+        $isSystem = $false
+        if ($null -ne $systemData -and $data.Length -eq $systemData.Length) {
+            $isSystem = $true
+            for ($i = 0; $i -lt $data.Length; $i++) {
+                if ($data[$i] -ne $systemData[$i]) { $isSystem = $false; break }
+            }
+        }
+
         [pscustomobject]@{
-            Name = $name
-            Guid = $Matches[1]
-            Data = [byte[]]$key.GetValue($name)
+            Name     = $name
+            Guid     = $Matches[1]
+            Data     = $data
+            IsSystem = $isSystem
         }
     }
 }
@@ -85,10 +109,13 @@ function Get-SpooferProviderDefinition {
             }
 
             foreach ($volume in $volumes) {
+                $note = '{0} bytes of mapping data' -f $volume.Data.Length
+                if ($volume.IsSystem) { $note = 'system volume - always left alone' }
+
                 [pscustomobject]@{
                     Item  = 'Volume GUID'
                     Value = '{{{0}}}' -f $volume.Guid
-                    Note  = '{0} bytes of mapping data' -f $volume.Data.Length
+                    Note  = $note
                 }
             }
         }
@@ -106,6 +133,11 @@ function Get-SpooferProviderDefinition {
             $results = New-Object System.Collections.ArrayList
 
             foreach ($volume in $volumes) {
+                if ($volume.IsSystem) {
+                    Write-SpooferLog -Level Info -Message "Leaving the system volume's GUID alone; the mount manager resolves the boot volume through it."
+                    continue
+                }
+
                 $newGuid = New-SpooferGuid -Format D
                 $newName = '\??\Volume{{{0}}}' -f $newGuid
                 $label   = 'Volume {{{0}}}' -f $volume.Guid
