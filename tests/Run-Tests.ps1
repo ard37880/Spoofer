@@ -770,6 +770,134 @@ Describe-Group 'Module selection checklist' {
     }
 }
 
+Describe-Group 'Menu' {
+
+    # Same approach as the checklist group: the menu lives in Spoofer.ps1, so its
+    # functions are lifted out of the syntax tree rather than by running the script.
+    $menuText = Get-Content -LiteralPath (Join-Path $root 'Spoofer.ps1') -Raw
+    $menuAst  = [System.Management.Automation.Language.Parser]::ParseInput($menuText, [ref]$null, [ref]$null)
+
+    foreach ($definition in $menuAst.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false)) {
+        if ($definition.Name -in @('Read-SpooferMenuChoice', 'Format-SpooferBackupLine', 'Select-SpooferBackupInteractive')) {
+            . ([scriptblock]::Create($definition.Extent.Text))
+        }
+    }
+
+    $script:Typed  = @()
+    $script:TypedAt = 0
+
+    function Read-Host {
+        param([string]$Prompt)
+        if ($script:TypedAt -ge $script:Typed.Count) { return $null }
+        $value = $script:Typed[$script:TypedAt]
+        $script:TypedAt++
+        return $value
+    }
+
+    function Set-Typed {
+        param([string[]]$Keys)
+        $script:Typed   = $Keys
+        $script:TypedAt = 0
+    }
+
+    Test-Case 'A valid choice is returned as declared' {
+        Set-Typed -Keys @('3')
+        Assert-Equal '3' (Read-SpooferMenuChoice -Key @('0', '1', '2', '3') 6>$null)
+    }
+
+    Test-Case 'Surrounding whitespace is ignored' {
+        Set-Typed -Keys @('  2  ')
+        Assert-Equal '2' (Read-SpooferMenuChoice -Key @('1', '2') 6>$null)
+    }
+
+    Test-Case 'An invalid choice re-prompts instead of being accepted' {
+        Set-Typed -Keys @('9', 'banana', '', '1')
+        Assert-Equal '1' (Read-SpooferMenuChoice -Key @('0', '1') 6>$null)
+        Assert-Equal 4 $script:TypedAt 'every bad answer should have been read and rejected'
+    }
+
+    Test-Case 'A closed input stream ends the prompt rather than looping forever' {
+        # Read-Host returns nothing in a non-interactive host. Without this the
+        # menu would spin on an unreadable stream.
+        Set-Typed -Keys @()
+        Assert-Equal $null (Read-SpooferMenuChoice -Key @('0', '1') 6>$null)
+    }
+
+    Test-Case 'A backup renders with its id, age, size and state' {
+        $session = New-SpooferBackupSession -Note 'a note' -Modules @('mac')
+        Add-SpooferBackupEntry -Session $session -Type 'Stub' -Label 'x' -Data @{ Value = 1 } | Out-Null
+
+        $line = Format-SpooferBackupLine -Session $session
+        Assert-Match ([regex]::Escape($session.Id)) $line
+        Assert-Match '1 entries' $line
+        Assert-Match 'not yet restored' $line
+        Assert-Match 'a note' $line
+    }
+
+    Test-Case 'A restored backup says so' {
+        $session = New-SpooferBackupSession -Modules @('mac')
+        Add-SpooferBackupEntry -Session $session -Type 'Stub' -Label 'x' -Data @{ Value = 1 } | Out-Null
+        $session.Restored = $true
+
+        Assert-Match 'already restored' (Format-SpooferBackupLine -Session $session)
+    }
+
+    Test-Case 'An unparsable timestamp does not break the line' {
+        $session = New-SpooferBackupSession -Modules @('mac')
+        Add-SpooferBackupEntry -Session $session -Type 'Stub' -Label 'x' -Data @{ Value = 1 } | Out-Null
+        $session.CreatedUtc = 'not a date'
+
+        Assert-Match ([regex]::Escape($session.Id)) (Format-SpooferBackupLine -Session $session 6>$null)
+    }
+
+    Test-Case 'The backup picker returns the chosen session' {
+        $groupRoot = Join-Path $sandbox 'menu'
+        $outerRoot = $env:SPOOFER_ROOT
+        $env:SPOOFER_ROOT = $groupRoot
+        Initialize-SpooferRoot | Out-Null
+
+        try {
+            $first = New-SpooferBackupSession -Note 'first' -Modules @('mac')
+            Add-SpooferBackupEntry -Session $first -Type 'Stub' -Label 'x' -Data @{ Value = 1 } | Out-Null
+            Save-SpooferBackupSession -Session $first | Out-Null
+
+            $second = New-SpooferBackupSession -Note 'second' -Modules @('mac')
+            $second.CreatedUtc = ([datetime]::UtcNow).AddMinutes(5).ToString('o')
+            Add-SpooferBackupEntry -Session $second -Type 'Stub' -Label 'y' -Data @{ Value = 2 } | Out-Null
+            Save-SpooferBackupSession -Session $second | Out-Null
+
+            # Newest first, so entry 1 is the one created later.
+            Set-Typed -Keys @('1')
+            Assert-Equal $second.Id (Select-SpooferBackupInteractive -Title 'pick' 6>$null).Id
+
+            Set-Typed -Keys @('2')
+            Assert-Equal $first.Id (Select-SpooferBackupInteractive -Title 'pick' 6>$null).Id
+
+            Set-Typed -Keys @('0')
+            Assert-Equal $null (Select-SpooferBackupInteractive -Title 'pick' 6>$null)
+
+            Set-Typed -Keys @('7', '1')
+            Assert-Equal $second.Id (Select-SpooferBackupInteractive -Title 'pick' 6>$null).Id
+        } finally {
+            $env:SPOOFER_ROOT = $outerRoot
+        }
+    }
+
+    Test-Case 'The backup picker copes with there being none' {
+        $emptyRoot = Join-Path $sandbox 'menu-empty'
+        $outerRoot = $env:SPOOFER_ROOT
+        $env:SPOOFER_ROOT = $emptyRoot
+        Initialize-SpooferRoot | Out-Null
+
+        try {
+            Set-Typed -Keys @()
+            Assert-Equal $null (Select-SpooferBackupInteractive -Title 'pick' 6>$null)
+        } finally {
+            $env:SPOOFER_ROOT = $outerRoot
+        }
+    }
+}
+
 Describe-Group 'exFAT boot region' {
 
     $exfatModule = Import-Module (Join-Path $sourceDir 'Providers/11-VolumeSerial.psm1') -Force -PassThru -DisableNameChecking

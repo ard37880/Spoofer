@@ -85,8 +85,8 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet('Status', 'Spoof', 'Restore', 'List', 'Remove', 'Modules')]
-    [string]$Action = 'Status',
+    [ValidateSet('Menu', 'Status', 'Spoof', 'Restore', 'List', 'Remove', 'Modules')]
+    [string]$Action = 'Menu',
 
     [switch]$Interactive,
 
@@ -148,8 +148,17 @@ foreach ($name in @('Common', 'Native', 'BackupStore', 'RegistryHelper', 'Provid
 #region Elevation
 
 function Test-SpooferActionNeedsAdmin {
+    <#
+    .SYNOPSIS
+        True when an action should run elevated.
+    .DESCRIPTION
+        Everything except Modules, which prints static descriptions and reads
+        nothing. Status is included because disks, volumes and monitor EDID are
+        unreadable without administrator rights, and half a status report is
+        worse than none.
+    #>
     param([string]$Name)
-    return ($Name -in @('Spoof', 'Restore'))
+    return ($Name -ne 'Modules')
 }
 
 function Invoke-SpooferRelaunchElevated {
@@ -484,6 +493,243 @@ function Show-RebootNotice {
 
 #endregion
 
+#region Menu
+
+function Read-SpooferMenuChoice {
+    <#
+    .SYNOPSIS
+        Prompts until the answer is one of the offered keys.
+    .PARAMETER Key
+        Accepted answers, matched case-insensitively.
+    .OUTPUTS
+        The matching key in the case it was declared, or $null if the input
+        stream ended (which is how a non-interactive host answers a prompt).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string[]]$Key,
+
+        [string]$Prompt = '  Choose'
+    )
+
+    while ($true) {
+        $answer = Read-Host $Prompt
+
+        if ($null -eq $answer) { return $null }
+
+        $answer = $answer.Trim()
+        $match = @($Key | Where-Object { $_ -eq $answer })
+        if ($match.Count -eq 1) { return $match[0] }
+
+        Write-Host ('  "{0}" is not one of the options.' -f $answer) -ForegroundColor Yellow
+    }
+}
+
+function Wait-SpooferAcknowledge {
+    <#
+    .SYNOPSIS
+        Holds the screen so output is readable before the menu redraws.
+    #>
+    Write-Host ''
+    Read-Host '  Press Enter to return to the menu' | Out-Null
+}
+
+function Show-SpooferMainMenu {
+    <#
+    .SYNOPSIS
+        Draws the main menu.
+    #>
+    Write-Host ''
+    Write-Host '  ====================================================================' -ForegroundColor DarkGray
+    Write-Host '   What would you like to do?' -ForegroundColor White
+    Write-Host '  ====================================================================' -ForegroundColor DarkGray
+    Write-Host ''
+    Write-Host '   1.' -ForegroundColor Cyan -NoNewline
+    Write-Host '  Show current identifiers' -ForegroundColor White
+    Write-Host '        What this machine currently reports. Changes nothing.' -ForegroundColor DarkGray
+    Write-Host ''
+    Write-Host '   2.' -ForegroundColor Cyan -NoNewline
+    Write-Host '  Preview a change' -ForegroundColor White
+    Write-Host '        Shows exactly what would change. Still writes nothing.' -ForegroundColor DarkGray
+    Write-Host ''
+    Write-Host '   3.' -ForegroundColor Cyan -NoNewline
+    Write-Host '  Change identifiers' -ForegroundColor White
+    Write-Host '        Pick which ones from a checklist, then apply. Backed up first.' -ForegroundColor DarkGray
+    Write-Host ''
+    Write-Host '   4.' -ForegroundColor Cyan -NoNewline
+    Write-Host '  Undo a change' -ForegroundColor White
+    Write-Host '        Put the original values back from a backup.' -ForegroundColor DarkGray
+    Write-Host ''
+    Write-Host '   5.' -ForegroundColor Cyan -NoNewline
+    Write-Host '  List backups' -ForegroundColor White
+    Write-Host ''
+    Write-Host '   6.' -ForegroundColor Cyan -NoNewline
+    Write-Host '  Explain the modules' -ForegroundColor White
+    Write-Host ''
+    Write-Host '   7.' -ForegroundColor Cyan -NoNewline
+    Write-Host '  Delete a backup' -ForegroundColor White
+    Write-Host ''
+    Write-Host '   0.' -ForegroundColor DarkGray -NoNewline
+    Write-Host '  Exit' -ForegroundColor Gray
+    Write-Host ''
+}
+
+function Format-SpooferBackupLine {
+    <#
+    .SYNOPSIS
+        One backup rendered for the picker.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject]$Session
+    )
+
+    $taken = $Session.CreatedUtc
+    try   { $taken = ([datetime]$Session.CreatedUtc).ToLocalTime().ToString('dd MMM HH:mm') }
+    catch { Write-SpooferLog -Level Debug -Message "Unparsable timestamp on $($Session.Id)." }
+
+    $state = if ($Session.Restored) { 'already restored' } else { 'not yet restored' }
+    $note  = if ($Session.Note) { "  {0}" -f $Session.Note } else { '' }
+
+    return ('{0}   {1}   {2} entries   {3}{4}' -f $Session.Id, $taken, $Session.Entries.Count, $state, $note)
+}
+
+function Select-SpooferBackupInteractive {
+    <#
+    .SYNOPSIS
+        Numbered picker over the stored backups.
+    .OUTPUTS
+        The chosen session, or $null when there is nothing to pick or the user
+        backs out.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Title
+    )
+
+    $sessions = @(Get-SpooferBackupSession -IncludeRestored)
+
+    if ($sessions.Count -eq 0) {
+        Write-Host ''
+        Write-SpooferLog -Level Info -Message 'There are no backups yet.'
+        return $null
+    }
+
+    Write-Host ''
+    Write-Host ("  {0}" -f $Title) -ForegroundColor White
+    Write-Host '  --------------------------------------------------------------------' -ForegroundColor DarkGray
+
+    for ($i = 0; $i -lt $sessions.Count; $i++) {
+        $colour = if ($sessions[$i].Restored) { 'DarkGray' } else { 'White' }
+        Write-Host ('  {0,2}. ' -f ($i + 1)) -ForegroundColor Cyan -NoNewline
+        Write-Host (Format-SpooferBackupLine -Session $sessions[$i]) -ForegroundColor $colour
+    }
+
+    Write-Host '   0. Back' -ForegroundColor DarkGray
+    Write-Host ''
+
+    $keys   = @('0') + @(1..$sessions.Count | ForEach-Object { [string]$_ })
+    $choice = Read-SpooferMenuChoice -Key $keys
+
+    if ($null -eq $choice -or $choice -eq '0') { return $null }
+    return $sessions[[int]$choice - 1]
+}
+
+function Invoke-MenuAction {
+    <#
+    .SYNOPSIS
+        The interactive menu, so nothing has to be typed as a command.
+    .DESCRIPTION
+        Each branch reuses the same functions the command line calls, so the two
+        routes cannot drift apart. Script-scoped parameters are set before each
+        call because those functions read them directly.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Test-Environment
+
+    while ($true) {
+        Show-SpooferMainMenu
+
+        $choice = Read-SpooferMenuChoice -Key @('0', '1', '2', '3', '4', '5', '6', '7')
+        if ($null -eq $choice -or $choice -eq '0') {
+            Write-Host ''
+            Write-SpooferLog -Level Info -Message 'Done.'
+            return
+        }
+
+        try {
+            switch ($choice) {
+
+                '1' {
+                    $script:Interactive = $false
+                    $script:DryRun      = $false
+                    Invoke-StatusAction
+                    Wait-SpooferAcknowledge
+                }
+
+                '2' {
+                    # A preview still picks its modules, so the checklist runs first.
+                    $script:Interactive = $true
+                    $script:DryRun      = $true
+                    Invoke-SpoofAction
+                    $script:DryRun = $false
+                    Wait-SpooferAcknowledge
+                }
+
+                '3' {
+                    $script:Interactive = $true
+                    $script:DryRun      = $false
+                    Invoke-SpoofAction
+                    Wait-SpooferAcknowledge
+                }
+
+                '4' {
+                    $session = Select-SpooferBackupInteractive -Title 'Which backup would you like to undo?'
+                    if ($session) {
+                        $script:BackupId = $session.Id
+                        $script:Force    = $true    # an explicitly chosen backup may be replayed
+                        Invoke-RestoreAction
+                        $script:Force = $false
+                        Wait-SpooferAcknowledge
+                    }
+                }
+
+                '5' {
+                    Invoke-ListAction
+                    Wait-SpooferAcknowledge
+                }
+
+                '6' {
+                    Invoke-ModulesAction
+                    Wait-SpooferAcknowledge
+                }
+
+                '7' {
+                    $session = Select-SpooferBackupInteractive -Title 'Which backup would you like to delete?'
+                    if ($session) {
+                        $script:BackupId = $session.Id
+                        Invoke-RemoveAction
+                        Wait-SpooferAcknowledge
+                    }
+                }
+            }
+        } catch {
+            Write-Host ''
+            Write-SpooferLog -Level Error -Message $_.Exception.Message
+            Write-SpooferLog -Level Debug -NoConsole -Message ($_.ScriptStackTrace)
+            Wait-SpooferAcknowledge
+        }
+    }
+}
+
+#endregion
+
 #region Actions
 
 function Invoke-StatusAction {
@@ -742,24 +988,25 @@ try {
 
 Show-Header
 
-if ($Action -in @('Status', 'Spoof')) { Show-Environment }
+if ($Action -in @('Menu', 'Status', 'Spoof')) { Show-Environment }
 
 Write-SpooferLog -Level Debug -NoConsole -Message ("Invoked: -Action {0} -Module '{1}' -DryRun:{2} -Force:{3}" -f $Action, ($Module -join ','), $DryRun, $Force)
 
 # Ask for elevation before doing anything, so the work happens in one place
 # rather than half here and half in an elevated child.
-if ((Test-SpooferActionNeedsAdmin -Name $Action) -and -not $DryRun -and
+if ((Test-SpooferActionNeedsAdmin -Name $Action) -and
     (Test-SpooferOnWindows) -and -not (Test-SpooferAdmin) -and -not $NoElevate) {
 
     if (Invoke-SpooferRelaunchElevated -BoundParameters $PSBoundParameters) { return }
 
     Write-Host ''
-    Write-SpooferLog -Level Error -Message "-Action $Action needs administrator rights. Re-run from an elevated PowerShell, or use Spoofer.cmd."
+    Write-SpooferLog -Level Error -Message 'Administrator rights are needed. Approve the prompt, or start PowerShell with Run as administrator.'
     exit 1
 }
 
 try {
     switch ($Action) {
+        'Menu'    { Invoke-MenuAction }
         'Status'  { Invoke-StatusAction }
         'Spoof'   { Invoke-SpoofAction }
         'Restore' { Invoke-RestoreAction }

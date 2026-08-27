@@ -2,13 +2,13 @@
 rem ---------------------------------------------------------------------------
 rem Convenience launcher for Spoofer.ps1.
 rem
-rem Bypasses the execution policy for this process only - nothing machine-wide is
-rem changed - and forwards any arguments through. Spoofer.ps1 asks Windows for
-rem administrator rights itself when the action needs them, so this does not have
-rem to elevate first:
+rem Run it with no arguments, or double-click it, for the menu. Spoofer.ps1 asks
+rem Windows for administrator rights itself, so this does not have to elevate
+rem first; it only bypasses the execution policy for this one process, changing
+rem nothing machine-wide.
 rem
 rem     Spoofer.cmd
-rem     Spoofer.cmd -Action Spoof -Interactive
+rem     Spoofer.cmd -Action Status
 rem     Spoofer.cmd -Action Spoof -Exclude digitalproductid,volumeserial
 rem ---------------------------------------------------------------------------
 setlocal
