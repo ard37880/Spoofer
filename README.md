@@ -8,7 +8,25 @@ Nothing is changed without being recorded first. Each run writes a backup sessio
 containing the original value of everything it touched, and `-Action Restore`
 replays that session to return the machine to exactly the state it was in.
 
+Double-click `Spoofer.cmd`, or run it with no arguments, and it asks Windows for
+administrator rights and then puts up a menu:
+
+```
+   1.  Show current identifiers
+   2.  Preview a change
+   3.  Change identifiers
+   4.  Undo a change
+   5.  List backups
+   6.  Explain the modules
+   7.  Delete a backup
+   0.  Exit
+```
+
+Nothing has to be typed as a command. Everything below is the same tool driven
+from the command line instead.
+
 ```powershell
+.\Spoofer.ps1                                    # the menu
 .\Spoofer.ps1 -Action Status                     # what the identifiers are now
 .\Spoofer.ps1 -Action Spoof -DryRun              # what would change
 .\Spoofer.ps1 -Action Spoof                      # change everything
@@ -23,12 +41,13 @@ configuration included. `-Interactive` gives you a checklist instead.
 
 - Windows 10 or 11 (build 10240 or later)
 - Windows PowerShell 5.1, which ships with both, or PowerShell 7+
-- A **64-bit** shell for `Spoof` and `Restore`
+- A **64-bit** shell
 
-Those two actions need administrator rights, and the script asks Windows for
-them itself: run it from an ordinary prompt and it reopens elevated after the
-UAC prompt. `-NoElevate` turns that off for unattended runs that are already
-elevated.
+Every action except `Modules` needs administrator rights, and the script asks
+Windows for them itself: run it from an ordinary prompt and it reopens elevated
+after the UAC prompt. `Status` is included because disks, volumes and monitor
+EDID cannot be read without them, and half a status report is worse than none.
+`-NoElevate` turns that off for unattended runs that are already elevated.
 
 A 32-bit PowerShell on 64-bit Windows is refused rather than run: registry writes
 would be redirected into `WOW6432Node` and would silently miss the real values.
@@ -39,11 +58,18 @@ would be redirected into `WOW6432Node` and would silently miss the real values.
 git clone https://github.com/ard37880/Spoofer.git
 cd Spoofer
 
+# The menu. Handles the execution policy and asks for administrator rights.
+.\Spoofer.cmd
+```
+
+To drive it from the command line instead:
+
+```powershell
 # Windows blocks unsigned scripts by default. This allows them for this window
 # only; it dies with the shell and changes nothing machine-wide.
 Set-ExecutionPolicy Bypass -Scope Process -Force
 
-# Look before you leap: reads only, no elevation needed for most of it.
+# Look before you leap: reads only, changes nothing.
 .\Spoofer.ps1 -Action Status
 
 # Show every change that would be made, and write nothing.
@@ -125,7 +151,7 @@ lets you tick individual modules.
 ## Usage
 
 ```
-.\Spoofer.ps1 [-Action <Status|Spoof|Restore|List|Remove|Modules>]
+.\Spoofer.ps1 [-Action <Menu|Status|Spoof|Restore|List|Remove|Modules>]
               [-Interactive]
               [-Module <names>] [-Exclude <names>]
               [-Tier <Standard|Advanced|Risky>] [-SafeOnly]
@@ -140,7 +166,8 @@ lets you tick individual modules.
 
 | Action | What it does |
 |---|---|
-| `Status` | Prints the current value of every identifier. The default. |
+| `Menu` | Interactive menu. The default when no action is given. |
+| `Status` | Prints the current value of every identifier. |
 | `Spoof` | Backs up, then changes, the selected identifiers. |
 | `Restore` | Replays a backup session, putting the original values back. |
 | `List` | Lists stored backups and whether each has been restored. |
