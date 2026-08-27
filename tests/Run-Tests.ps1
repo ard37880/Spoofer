@@ -34,7 +34,7 @@ Get-Module |
     Where-Object { $_.Path -and $_.Path.StartsWith($sourceDir, [System.StringComparison]::OrdinalIgnoreCase) } |
     Remove-Module -Force
 
-foreach ($name in @('Common', 'Native', 'BackupStore', 'RegistryHelper', 'ProviderCommon', 'ProviderRegistry', 'Verify')) {
+foreach ($name in @('Common', 'Native', 'BackupStore', 'RegistryHelper', 'ProviderCommon', 'ProviderRegistry', 'Verify', 'Gpt')) {
     Import-Module (Join-Path $sourceDir "$name.psm1") -DisableNameChecking
 }
 
@@ -767,6 +767,138 @@ Describe-Group 'Module selection checklist' {
 
     Test-Case 'Selection order follows the catalogue, not the order typed' {
         Assert-Equal 'machineguid,mac' (Invoke-Picker -Keystrokes @('n', 'mac machineguid', '') -PreSelected $null)
+    }
+}
+
+Describe-Group 'GPT structures' {
+
+    function New-FakeGpt {
+        <#
+            Builds a minimal but structurally valid GPT: one header sector and a
+            partition array with two entries in use, checksums correct.
+        #>
+        param([int]$SectorSize = 512, [int]$EntryCount = 128, [int]$EntrySize = 128)
+
+        $header = New-Object 'byte[]' $SectorSize
+        [System.Array]::Copy([System.Text.Encoding]::ASCII.GetBytes('EFI PART'), 0, $header, 0, 8)
+        [System.Array]::Copy([System.BitConverter]::GetBytes([uint32]92), 0, $header, 12, 4)   # header size
+        [System.Array]::Copy([System.BitConverter]::GetBytes([int64]1), 0, $header, 24, 8)     # current LBA
+        [System.Array]::Copy([System.BitConverter]::GetBytes([int64]40), 0, $header, 32, 8)    # backup LBA
+        [System.Array]::Copy(([guid]'11111111-2222-3333-4444-555555555555').ToByteArray(), 0, $header, 56, 16)
+        [System.Array]::Copy([System.BitConverter]::GetBytes([int64]2), 0, $header, 72, 8)     # array LBA
+        [System.Array]::Copy([System.BitConverter]::GetBytes([uint32]$EntryCount), 0, $header, 80, 4)
+        [System.Array]::Copy([System.BitConverter]::GetBytes([uint32]$EntrySize), 0, $header, 84, 4)
+
+        $array = New-Object 'byte[]' ($EntryCount * $EntrySize)
+        $basic = [guid]'ebd0a0a2-b9e5-4433-87c0-68b6b72699c7'
+        foreach ($pair in @(@(0, 'System'), @(1, 'Data'))) {
+            $base = $pair[0] * $EntrySize
+            [System.Array]::Copy($basic.ToByteArray(), 0, $array, $base, 16)
+            [System.Array]::Copy([guid]::NewGuid().ToByteArray(), 0, $array, $base + 16, 16)
+            [System.Array]::Copy([System.BitConverter]::GetBytes([int64](2048 + $pair[0] * 100000)), 0, $array, $base + 32, 8)
+            [System.Array]::Copy([System.Text.Encoding]::Unicode.GetBytes($pair[1]), 0, $array, $base + 56, ([System.Text.Encoding]::Unicode.GetBytes($pair[1])).Length)
+        }
+
+        Update-SpooferGptChecksum -Header $header -HeaderOffset 0 -Array $array -ArrayLength $array.Length | Out-Null
+        return [pscustomobject]@{ Header = $header; Array = $array; EntryCount = $EntryCount; EntrySize = $EntrySize }
+    }
+
+    Test-Case 'CRC32 matches the published reference vectors' {
+        # The GPT checksums are worthless if this is wrong, and it is easy to get
+        # wrong: PowerShell reads an eight digit hex literal as a signed Int32.
+        # Decimal, not hex: 0xE8B7BE43 as a literal is a negative Int32 and will
+        # not cast to UInt32, which is the very trap this function documents.
+        $cases = @{
+            '123456789'                                   = [uint32]3421780262
+            'a'                                           = [uint32]3904355907
+            'abc'                                         = [uint32]891568578
+            'The quick brown fox jumps over the lazy dog' = [uint32]1095738169
+        }
+
+        foreach ($text in $cases.Keys) {
+            $actual = Get-SpooferCrc32 -Bytes ([System.Text.Encoding]::ASCII.GetBytes($text))
+            Assert-Equal $cases[$text] $actual "CRC32 of '$text'"
+        }
+    }
+
+    Test-Case 'An empty run has a zero CRC' {
+        Assert-Equal ([uint32]0) (Get-SpooferCrc32 -Bytes (New-Object 'byte[]' 0))
+    }
+
+    Test-Case 'A GPT header is recognised, and other bytes are not' {
+        Assert-True (Test-SpooferGptHeader -Bytes (New-FakeGpt).Header)
+        Assert-True (-not (Test-SpooferGptHeader -Bytes (New-Object 'byte[]' 512)))
+        Assert-True (-not (Test-SpooferGptHeader -Bytes (New-Object 'byte[]' 8))) 'too short to hold a header'
+        Assert-True (-not (Test-SpooferGptHeader -Bytes $null))
+    }
+
+    Test-Case 'Header fields parse back out' {
+        $gpt    = New-FakeGpt
+        $parsed = Read-SpooferGptHeader -Bytes $gpt.Header
+
+        Assert-Equal 92 $parsed.HeaderSize
+        Assert-Equal 1  $parsed.CurrentLba
+        Assert-Equal 40 $parsed.BackupLba
+        Assert-Equal 2  $parsed.ArrayLba
+        Assert-Equal 128 $parsed.EntryCount
+        Assert-Equal 128 $parsed.EntrySize
+        Assert-Equal '11111111-2222-3333-4444-555555555555' $parsed.DiskGuid.ToString()
+    }
+
+    Test-Case 'Only entries in use are returned' {
+        $gpt     = New-FakeGpt
+        $entries = @(Read-SpooferGptEntry -Array $gpt.Array -EntryCount $gpt.EntryCount -EntrySize $gpt.EntrySize)
+
+        Assert-Equal 2 $entries.Count 'the other 126 slots are empty'
+        Assert-Equal 'System' $entries[0].Name
+        Assert-Equal 'Data'   $entries[1].Name
+        Assert-Equal 2048     $entries[0].FirstLba
+        Assert-NotEqual $entries[0].UniqueGuid.ToString() $entries[1].UniqueGuid.ToString()
+    }
+
+    Test-Case 'A freshly built table verifies' {
+        Assert-True (Test-SpooferGptChecksum -Header (New-FakeGpt).Header -HeaderOffset 0)
+    }
+
+    Test-Case 'Changing a partition GUID and recomputing keeps the table valid' {
+        $gpt    = New-FakeGpt
+        $before = @(Read-SpooferGptEntry -Array $gpt.Array -EntryCount $gpt.EntryCount -EntrySize $gpt.EntrySize)
+        $newGuid = [guid]'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+
+        Set-SpooferGptEntryGuid -Array $gpt.Array -EntryOffset $before[0].Offset -Guid $newGuid
+        Update-SpooferGptChecksum -Header $gpt.Header -HeaderOffset 0 -Array $gpt.Array -ArrayLength $gpt.Array.Length | Out-Null
+
+        $after = @(Read-SpooferGptEntry -Array $gpt.Array -EntryCount $gpt.EntryCount -EntrySize $gpt.EntrySize)
+        Assert-Equal $newGuid.ToString() $after[0].UniqueGuid.ToString()
+        Assert-Equal $before[1].UniqueGuid.ToString() $after[1].UniqueGuid.ToString() 'the other partition must be untouched'
+        Assert-Equal $before[0].Name $after[0].Name 'the name must survive'
+        Assert-True (Test-SpooferGptChecksum -Header $gpt.Header -HeaderOffset 0) 'the header checksum must be recomputed'
+
+        $storedArrayCrc = [System.BitConverter]::ToUInt32($gpt.Header, 88)
+        Assert-Equal (Get-SpooferCrc32 -Bytes $gpt.Array) $storedArrayCrc 'the array checksum must match the array'
+    }
+
+    Test-Case 'Editing the array without recomputing invalidates the table' {
+        # The whole reason both checksums have to be rewritten.
+        $gpt = New-FakeGpt
+        $gpt.Array[16] = [byte](($gpt.Array[16] + 1) % 256)
+
+        $storedArrayCrc = [System.BitConverter]::ToUInt32($gpt.Header, 88)
+        Assert-NotEqual (Get-SpooferCrc32 -Bytes $gpt.Array) $storedArrayCrc
+    }
+
+    Test-Case 'A tampered header fails its own checksum' {
+        $gpt = New-FakeGpt
+        $gpt.Header[56] = [byte](($gpt.Header[56] + 1) % 256)
+        Assert-True (-not (Test-SpooferGptChecksum -Header $gpt.Header -HeaderOffset 0))
+    }
+
+    Test-Case 'A header claiming an impossible size is refused' {
+        $gpt = New-FakeGpt
+        [System.Array]::Copy([System.BitConverter]::GetBytes([uint32]99999), 0, $gpt.Header, 12, 4)
+
+        Assert-True (-not (Test-SpooferGptChecksum -Header $gpt.Header -HeaderOffset 0))
+        Assert-Throws { Update-SpooferGptChecksum -Header $gpt.Header -HeaderOffset 0 -Array $gpt.Array -ArrayLength $gpt.Array.Length } -Pattern 'does not fit'
     }
 }
 

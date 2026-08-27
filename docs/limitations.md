@@ -119,12 +119,14 @@ Not skips so much as work that is not done yet:
   both consumers.
 - **Extension blocks in EDID.** Only block 0 is rewritten and re-checksummed;
   CTA-861 extension blocks are left exactly as they were.
-- **Network interface GUIDs.** Each adapter has a GUID appearing in its class key
-  as `NetCfgInstanceId`, as a sub-key of `Tcpip\Parameters\Interfaces`, under
-  `Control\Network`, and in several service configurations. It is a genuine
-  per-machine identifier and it is writable, but every reference has to change
-  together, and one missed reference leaves the adapter with no working TCP/IP
-  binding. Left alone rather than half done.
+- **GPT partition GUIDs.** The parsing and checksum half is written and tested
+  in `src/Gpt.psm1`: it reads a partition table, rewrites an entry's GUID, and
+  recomputes both the entry-array CRC32 and the header CRC32 that every reader
+  checks. What is not wired up is the disk half, because applying it means
+  writing raw sectors to `\\.\PhysicalDriveN`, and a bad write there costs the
+  whole disk rather than one value. It also needs the boot configuration and
+  `MountedDevices` updated alongside it, both of which reference partition GUIDs
+  on a UEFI system.
 - **The machine SID.** Changing it breaks local accounts, profiles and any domain
   membership. Sysinternals withdrew NewSID over exactly this; the supported
   answer is sysprep on a fresh image, not an in-place edit.
