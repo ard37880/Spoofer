@@ -48,4 +48,4 @@ Downloaded the ZIP instead of cloning? Run `Get-ChildItem -Recurse | Unblock-Fil
 
 ## Disclaimer
 
-For machines you own or administer. Use at your own risk, and keep the backup until you've rebooted once.
+For machines you own or administer. Use at your own risk, and keep the backup until you've rebooted once. WILL NOT BYPASS KERNAL LEVLEL ANTI-CHEATS OR DETECTION
