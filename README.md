@@ -1,339 +1,51 @@
 # Spoofer
 
-A hardware identifier tool for Windows 10 and 11. It rewrites the values Windows
-exposes to software as "which machine is this" - and puts every one of them back
-on request.
+![Windows 10 | 11](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6)
+![PowerShell 5.1+](https://img.shields.io/badge/PowerShell-5.1%2B-5391FE)
 
-Nothing is changed without being recorded first. Each run writes a backup session
-containing the original value of everything it touched, and `-Action Restore`
-replays that session to return the machine to exactly the state it was in.
+Change the hardware IDs Windows reports, then put them all back with one command.
 
-Double-click `Spoofer.cmd`, or run it with no arguments, and it asks Windows for
-administrator rights and then puts up a menu:
+- **17 modules** - machine GUIDs, SMBIOS cache, MAC, disk and volume IDs, monitor EDID, and more
+- **Everything is backed up** before it changes, and one restore undoes the whole run
+- **Preview first** - dry-run mode shows every change without writing anything
+- **No install, no dependencies** - plain PowerShell
 
-```
-   1.  Show current identifiers
-   2.  Check what is actually hidden
-   3.  Preview a change
-   4.  Change identifiers
-   5.  Undo a change
-   6.  List backups
-   7.  Explain the modules
-   8.  Delete a backup
-   0.  Exit
-```
-
-Nothing has to be typed as a command. Everything below is the same tool driven
-from the command line instead.
-
-```powershell
-.\Spoofer.ps1                                    # the menu
-.\Spoofer.ps1 -Action Status                     # what the identifiers are now
-.\Spoofer.ps1 -Action Verify                     # what is actually hidden, and what is not
-.\Spoofer.ps1 -Action Spoof -DryRun              # what would change
-.\Spoofer.ps1 -Action Spoof                      # change everything
-.\Spoofer.ps1 -Action Spoof -Interactive         # tick what to change
-.\Spoofer.ps1 -Action Restore -BackupId latest   # change them back
-```
-
-Every module runs by default, the ones that can disturb licensing or the boot
-configuration included. `-Interactive` gives you a checklist instead.
-
-## Requirements
-
-- Windows 10 or 11 (build 10240 or later)
-- Windows PowerShell 5.1, which ships with both, or PowerShell 7+
-- A **64-bit** shell
-
-Every action except `Modules` needs administrator rights, and the script asks
-Windows for them itself: run it from an ordinary prompt and it reopens elevated
-after the UAC prompt. `Status` is included because disks, volumes and monitor
-EDID cannot be read without them, and half a status report is worse than none.
-`-NoElevate` turns that off for unattended runs that are already elevated.
-
-A 32-bit PowerShell on 64-bit Windows is refused rather than run: registry writes
-would be redirected into `WOW6432Node` and would silently miss the real values.
-
-## Getting started
+## Quick start
 
 ```powershell
 git clone https://github.com/ard37880/Spoofer.git
 cd Spoofer
-
-# The menu. Handles the execution policy and asks for administrator rights.
 .\Spoofer.cmd
 ```
 
-To drive it from the command line instead:
+It asks for admin rights, then shows a menu. That's it.
+
+## Command line
 
 ```powershell
-# Windows blocks unsigned scripts by default. This allows them for this window
-# only; it dies with the shell and changes nothing machine-wide.
-Set-ExecutionPolicy Bypass -Scope Process -Force
-
-# Look before you leap: reads only, changes nothing.
-.\Spoofer.ps1 -Action Status
-
-# Show every change that would be made, and write nothing.
-.\Spoofer.ps1 -Action Spoof -DryRun
-
-# Pick from a checklist, then run.
-.\Spoofer.ps1 -Action Spoof -Interactive
-
-# Or change everything.
-.\Spoofer.ps1 -Action Spoof
+.\Spoofer.ps1 -Action Status                     # show current IDs
+.\Spoofer.ps1 -Action Spoof -DryRun              # preview changes
+.\Spoofer.ps1 -Action Spoof -Interactive         # pick what to change
+.\Spoofer.ps1 -Action Spoof                      # change everything
+.\Spoofer.ps1 -Action Restore -BackupId latest   # undo
 ```
 
-Skip the `Set-ExecutionPolicy` line and you get
-`cannot be loaded because running scripts is disabled on this system`. If you
-would rather not set it at all, `Spoofer.cmd` does the same thing per process
-and forwards its arguments through:
+Run `.\Spoofer.ps1 -Action Modules` to see every module and what it touches.
 
-```
-Spoofer.cmd -Action Status
-```
+## Requirements
 
-Downloading the repository as a ZIP rather than cloning it adds a second
-hurdle: Windows marks the extracted files as blocked and PowerShell refuses to
-load the modules. `Get-ChildItem -Recurse | Unblock-File` clears it.
+- Windows 10 or 11, 64-bit
+- Windows PowerShell 5.1 (built in) or PowerShell 7+
+- Administrator rights (it asks for them)
 
-Every run prints the version it is running as its first line:
+Downloaded the ZIP instead of cloning? Run `Get-ChildItem -Recurse | Unblock-File` first.
 
-```
-  Build     : 2026.08.27 (e551def)
-```
+## Good to know
 
-Worth a glance before reporting anything that looks like a bug. An old copy
-looks exactly like a current one from the inside, and a ZIP extracted next to
-a clone is easy to run by accident. The commit in brackets is only there when
-the directory is a git checkout; the version on its own comes from the
-`VERSION` file, which travels with the ZIP.
+- Modules marked **boot** in the checklist (`diskid`, `volumeguid`) touch what Windows needs to start. Press `b` in the checklist to skip them.
+- Some IDs can't be changed from inside Windows, like firmware serials and the system drive's volume serial. Run `-Action Verify` to see what is actually hidden.
+- Changing these IDs can sign you out of licensed software and may need Windows reactivated.
 
-### Choosing what to change
+## Disclaimer
 
-`-Interactive` prints a checklist you can toggle before anything happens:
-
-```
-   #      Module            Tier      What it is
-   1. [x] machineguid       Standard  Cryptography MachineGuid
-   2. [x] machineid         Standard  Secondary machine identifiers
-   ...
-  10. [x] diskid            Advanced  Disk GUID / MBR signature                  boot
-  13. [x] edid              Advanced  Monitor EDID serials
-  14. [x] volumeguid        Advanced  Volume GUIDs                               boot restart
-
-   17 of 17 selected
-
-   Toggle : numbers or names, e.g. "1 4 7" or "mac volumeserial"
-   a all   n none   s standard   d advanced   r risky   i invert
-   b untick everything marked boot
-   Enter to run the ticked modules, q to cancel
-```
-
-A module marked **boot** rewrites something the machine needs in order to
-start. Both are backed up and repaired as they go, but a restart is the only
-real proof that worked, so `b` is there to take them off the list on a machine
-you cannot afford to reinstall. **restart** just means the change lands on the
-next boot.
-
-The same choices are available non-interactively: `-Module` to name them,
-`-Exclude` to drop some, `-Tier` to pick a tier, and `-SafeOnly` for everything
-except the Risky tier.
-
-## What it changes
-
-Run `.\Spoofer.ps1 -Action Modules` for the current list with full detail.
-
-| Module | Tier | What it rewrites |
-|---|---|---|
-| `machineguid` | Standard | `Cryptography\MachineGuid`, the value most software treats as the machine ID |
-| `machineid` | Standard | SQM/telemetry machine id, Windows Media unique id, Remote Desktop client hardware id |
-| `hwprofile` | Standard | `HwProfileGuid` for every hardware profile |
-| `windowsinstall` | Standard | Build GUID and the OS install timestamp |
-| `telemetry` | Standard | Windows Update client id, per-user advertising id |
-| `smbios` | Advanced | Cached SMBIOS strings: manufacturer, model, family, SKU, BIOS vendor/version/date |
-| `computername` | Advanced | Hostname, in all four places Windows keeps it (needs a restart) |
-| `mac` | Advanced | A locally administered MAC address on each physical adapter |
-| `diskid` | Advanced | GPT disk GUID, or the MBR signature - boot disks included, with the boot configuration rewritten to match |
-| `edid` | Advanced | The serial in each cached monitor EDID, checksum recomputed |
-| `volumeguid` | Advanced | The `\\?\Volume{...}` GUID of every volume except the system one, leaving drive letters alone |
-| `networkprofile` | Advanced | Network profile GUIDs, and with them the record of every network joined |
-| `productid` | Risky | The Windows `ProductId` string |
-| `digitalproductid` | Risky | The `DigitalProductId` blobs - the binary form of the installed product key |
-| `volumeserial` | Risky | The `XXXX-XXXX` serial in every volume's boot record, NTFS backup sectors and exFAT checksums included. Skips the system volume and paging-file volumes |
-| `browser` | Risky | Cookies, local and session storage, IndexedDB and service workers, for every browser profile |
-| `interfaceguid` | Risky | The GUID of each network adapter, in all five places Windows records it, undone on the spot if any one of them fails (needs a restart) |
-
-Tiers describe blast radius, not effectiveness:
-
-- **Standard** - reversible registry values, no restart, nothing else depends on them.
-- **Advanced** - touches devices or the partition table, or needs a restart.
-- **Risky** - can disturb software licensing or activation, or writes raw disk
-  sectors.
-
-The tier is not the same question as whether a module can stop the machine
-starting. `diskid` and `volumeguid` are the two that can, and the checklist
-marks them **boot** whatever their tier.
-
-All three run by default. `-SafeOnly` leaves out the Risky tier; `-Interactive`
-lets you tick individual modules.
-
-## Usage
-
-```
-.\Spoofer.ps1 [-Action <Menu|Status|Verify|Spoof|Restore|List|Remove|Modules>]
-              [-Interactive]
-              [-Module <names>] [-Exclude <names>]
-              [-Tier <Standard|Advanced|Risky>] [-SafeOnly]
-              [-Seed <int>] [-BackupId <id|latest>] [-Note <text>]
-              [-DryRun] [-Force] [-Yes] [-NoElevate]
-              [-IncludeVirtualAdapters] [-IncludeRemovableVolumes]
-              [-SkipDomainRename] [-NoVolumeDismount]
-              [-NoRestartPrompt] [-LogLevel <Debug|Info|Warn|Error>]
-```
-
-### Actions
-
-| Action | What it does |
-|---|---|
-| `Menu` | Interactive menu. The default when no action is given. |
-| `Status` | Prints the current value of every identifier. |
-| `Verify` | Compares what Windows reports against what the hardware says. |
-| `Spoof` | Backs up, then changes, the selected identifiers. |
-| `Restore` | Replays a backup session, putting the original values back. |
-| `List` | Lists stored backups and whether each has been restored. |
-| `Remove` | Deletes a stored backup. |
-| `Modules` | Describes every module and the exact values it owns. |
-
-### Examples
-
-```powershell
-# Tick what to change from a checklist.
-.\Spoofer.ps1 -Action Spoof -Interactive
-
-# Just the machine IDs and the MAC addresses.
-.\Spoofer.ps1 -Action Spoof -Module machineguid,machineid,mac
-
-# Everything except the two that touch activation.
-.\Spoofer.ps1 -Action Spoof -Exclude productid,digitalproductid
-
-# Everything except the Risky tier, without prompting.
-.\Spoofer.ps1 -Action Spoof -SafeOnly -Yes
-
-# Reproducible identity: the same seed always generates the same values.
-.\Spoofer.ps1 -Action Spoof -Seed 20260825 -Note 'test rig profile A'
-
-# Undo the last spoof.
-.\Spoofer.ps1 -Action Restore -BackupId latest
-
-# Undo one module from an older backup, leaving the rest of it in place.
-.\Spoofer.ps1 -Action Restore -BackupId 20260825-121500 -Module mac
-
-# What have I got stored?
-.\Spoofer.ps1 -Action List
-```
-
-## Reverting
-
-Every `Spoof` writes a session under `%ProgramData%\Spoofer\backups\<id>\`:
-
-```
-manifest.json     every original value, with its registry type preserved
-files\            raw blobs, such as a volume's original boot sector
-```
-
-`-Action Restore` replays a session's entries in reverse order, so changes unwind
-in the opposite order they were made. Points worth knowing:
-
-- **`latest` means the newest backup you have not restored yet.** Spoof twice and
-  restore twice, and you walk back through the stack one step at a time.
-- **A partial restore stays open.** If an entry fails, the session is left marked
-  un-restored so you can fix the cause and run the same command again. One
-  failing entry never stops the others.
-- **Restores are verified where it matters.** A disk is checked against its
-  recorded serial, and a volume against its filesystem, before anything is
-  written - so a reformat or a drive-letter change since the backup is refused
-  rather than acted on.
-- **A backup is worth keeping until you are sure.** `-Action Remove` warns before
-  deleting one that has not been restored, because that is the only record of
-  the original values.
-
-Set `SPOOFER_ROOT` to move the backup and log directory somewhere else - onto a
-removable drive, for instance, so the record does not live on the machine being
-changed.
-
-## What it does not do
-
-Some identifiers are not writable from user mode at all, and some regenerate on
-their own. Check before assuming a
-value stayed changed.
-
-In short: this changes what Windows *reports*. It does not reflash firmware, and
-it does not touch anything read directly from hardware.
-
-`-Action Verify` shows you exactly where that line falls on your machine. It
-runs both reads and sorts every value into three buckets:
-
-```
-covered       this tool controls the value completely
-cache only    the registry copy was rewritten, but the firmware or the driver
-              still returns the original, and both are printed
-not covered   read straight from hardware, never touched
-```
-
-The clearest example is a network adapter: after a spoof, `MacAddress` is the
-new one and `PermanentAddress` is still the address burned into the card. Any
-caller that asks NDIS for the permanent address gets the real one.
-
-Two things are worth knowing before a full run:
-
-- **The boot disk.** Its identifier is referenced by the boot configuration,
-  whether the disk is GPT or MBR. `diskid` exports the boot store, changes the
-  identifier, and rewrites the boot entries with `bcdboot`; if any of that
-  fails, the identifier goes straight back and the store is re-imported. A
-  restart is still the only real proof.
-- **The system volume's serial.** Windows will not let the volume it is running
-  from be locked, so the write is attempted and reported honestly rather than
-  skipped silently. Boot from Windows PE and run the same command there and it
-  works, because `C:` is not the system volume in that environment.
-
-## Development
-
-### Layout
-
-```
-Spoofer.ps1              command line entry point
-Spoofer.cmd              elevating launcher
-src/
-  Common.psm1            logging, environment probes, identifier generation
-  Verify.psm1            reported versus authoritative comparison
-  Gpt.psm1               GUID partition table parsing and checksums
-  Native.psm1            P/Invoke: token privileges, locked boot-sector I/O
-  BackupStore.psm1       backup sessions and the restore dispatcher
-  RegistryHelper.psm1    registry read/write with automatic backup
-  ProviderCommon.psm1    shared helpers for registry-backed providers
-  ProviderRegistry.psm1  provider discovery and selection
-  Providers/*.psm1       one module per group of identifiers
-```
-
-### Adding a module
-
-Drop a `.psm1` into `src/Providers/` exporting a single
-`Get-SpooferProviderDefinition` that returns a descriptor with `Name`, `Title`,
-`Tier`, `Description`, `Targets`, and the `GetState` and `Invoke` scriptblocks.
-It is picked up automatically and validated at load time. For registry values,
-`New-SpooferRegistryTarget` plus `Invoke-SpooferRegistryTarget` handles the
-backup, the dry-run path and the output for you - `src/Providers/01-MachineGuid.psm1`
-is about as small as a provider gets.
-
-Anything that is not a registry value needs a restore handler: call
-`Register-SpooferRestoreHandler` with the entry type and a scriptblock that
-undoes it. `09-NetworkAdapter.psm1` and `11-VolumeSerial.psm1` are the worked
-examples.
-
-## Scope
-
-This is for machines you own or administer. Changing these values will log you
-out of software licensed to this machine, and services that expect a stable
-device identity may treat the result as a new or suspicious device. That is the
-point of the tool, and it is also the reason every change is backed up first.
+For machines you own or administer. Use at your own risk, and keep the backup until you've rebooted once.
