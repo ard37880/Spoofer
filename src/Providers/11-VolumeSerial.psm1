@@ -17,9 +17,10 @@
     Every sector this provider touches is saved to the backup session first, so a
     restore rewrites the exact bytes that were there.
 .NOTES
-    The system volume is attempted like any other. Windows will normally refuse
-    to lock the volume it is running from, in which case the failure is reported
-    with the offline procedure that does work.
+    The system volume, and any volume holding a paging file, is skipped. Neither
+    can be locked while Windows runs, and the fallback used for busy volumes -
+    a forced dismount - pulls the registry hives and paging file out from under
+    the kernel and blue-screens the machine. Changing them needs Windows PE.
 #>
 
 Set-StrictMode -Version Latest
@@ -224,6 +225,8 @@ function Get-SpooferSpoofableVolume {
     $systemLetter = ''
     if ($env:SystemDrive) { $systemLetter = $env:SystemDrive.TrimEnd(':').ToUpperInvariant() }
 
+    $pinned = @(Get-SpooferUndismountableVolume)
+
     try {
         $volumes = @(Get-Volume -ErrorAction Stop)
     } catch {
@@ -243,6 +246,9 @@ function Get-SpooferSpoofableVolume {
             FileSystem  = [string]$volume.FileSystem
             DriveType   = [string]$volume.DriveType
             IsSystem    = ($letter -eq $systemLetter)
+            # The system volume, or one holding a paging file. Neither can be
+            # locked while Windows runs, and dismounting either crashes it.
+            IsPinned    = ($pinned -contains $letter)
             SectorSize  = (Get-SpooferVolumeSectorSize -DriveLetter $letter)
         }
     }
@@ -389,8 +395,8 @@ function Get-SpooferProviderDefinition {
         Title          = 'Volume serial numbers'
         Tier           = 'Risky'
         RequiresReboot = $false
-        Description    = 'Rewrites the serial number in every fixed volume''s boot record, including NTFS backup boot sectors and both exFAT boot regions with their checksums recomputed. Every sector touched is saved before any write.'
-        Targets        = @('Volume boot record of every fixed, lettered volume, the system volume included')
+        Description    = 'Rewrites the serial number in every fixed volume''s boot record, including NTFS backup boot sectors and both exFAT boot regions with their checksums recomputed. Every sector touched is saved before any write. The system volume and any volume holding a paging file are left alone; those need Windows PE.'
+        Targets        = @('Volume boot record of every fixed, lettered volume, except the system volume and paging-file volumes')
 
         GetState = {
             param($Context)
@@ -412,7 +418,8 @@ function Get-SpooferProviderDefinition {
                         [pscustomobject]@{ Item = $item; Value = '<unrecognised>'; Note = "$($volume.FileSystem) boot record not understood" }
                     } else {
                         $note = $layout.FileSystem
-                        if ($volume.IsSystem) { $note += ', system volume' }
+                        if ($volume.IsSystem) { $note += ', system volume - needs Windows PE' }
+                        elseif ($volume.IsPinned) { $note += ', holds a paging file - needs Windows PE' }
                         [pscustomobject]@{ Item = $item; Value = (Format-VolumeSerial -Sector $sector -Offset $layout.Offset); Note = $note }
                     }
                 } catch {
@@ -437,6 +444,16 @@ function Get-SpooferProviderDefinition {
 
             foreach ($volume in $volumes) {
                 $label = 'Volume {0}: serial' -f $volume.DriveLetter
+
+                if ($volume.IsPinned) {
+                    $why = if ($volume.IsSystem) { 'it is the volume Windows is running from' } else { 'it holds a paging file' }
+                    Write-SpooferLog -Level Warn -Message "Leaving $($volume.DriveLetter): alone: $why, so it cannot be locked, and dismounting it would crash Windows. Run this module from Windows PE to change it."
+                    [void]$results.Add([pscustomobject]@{
+                        Label = $label; OldValue = $null; NewValue = $null
+                        Changed = $false; Simulated = $false; Skipped = $true; Reason = "Cannot be changed while Windows runs from it ($why)"
+                    })
+                    continue
+                }
 
                 try {
                     $plan = Get-VolumeSerialPlan -DriveLetter $volume.DriveLetter -SectorSize $volume.SectorSize
@@ -508,11 +525,7 @@ function Get-SpooferProviderDefinition {
                 } catch {
                     Write-SpooferLog -Level Error -Message "$($volume.DriveLetter): $($_.Exception.Message)"
 
-                    if ($volume.IsSystem) {
-                        Write-SpooferLog -Level Info -Message "Windows will not let the volume it is running from be locked. Boot from Windows PE or another installation, where $($volume.DriveLetter): is not the system volume, and run the same command there."
-                    } else {
-                        Write-SpooferLog -Level Info -Message "Close anything holding $($volume.DriveLetter): open and retry."
-                    }
+                    Write-SpooferLog -Level Info -Message "Close anything holding $($volume.DriveLetter): open and retry."
 
                     [void]$results.Add([pscustomobject]@{
                         Label = $label; OldValue = $plan.OldSerial; NewValue = $plan.NewSerial

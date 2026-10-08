@@ -372,10 +372,54 @@ function Read-SpooferVolumeSector {
     return ,([Spoofer.Native]::ReadSectors($path, $ByteOffset, $Length))
 }
 
+function Get-SpooferUndismountableVolume {
+    <#
+    .SYNOPSIS
+        Drive letters that must never be force-dismounted.
+    .DESCRIPTION
+        The volume Windows is running from, and any volume holding a paging
+        file. A forced dismount invalidates every open handle on the volume, and
+        on these the handles belong to the kernel - the registry hives, the
+        paging file, the running system's own executables. Pulling them out from
+        under it stops the machine with a bugcheck on the spot, which is what a
+        full run used to do.
+    #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param()
+
+    $letters = New-Object System.Collections.Generic.List[string]
+
+    if ($env:SystemDrive) {
+        $letters.Add($env:SystemDrive.TrimEnd(':').ToUpperInvariant())
+    }
+
+    if (Test-SpooferOnWindows) {
+        # ExistingPageFiles lists what is in use right now, as \??\C:\pagefile.sys;
+        # PagingFiles is the configuration, as "D:\pagefile.sys 0 0" or "?:\..."
+        # for automatic placement. Both are read so neither form is missed.
+        $key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management'
+        foreach ($valueName in @('ExistingPageFiles', 'PagingFiles')) {
+            $entries = @((Get-ItemProperty -LiteralPath $key -Name $valueName -ErrorAction SilentlyContinue).$valueName)
+            foreach ($entry in $entries) {
+                if ([string]$entry -match '([A-Za-z]):\\') {
+                    $letters.Add($Matches[1].ToUpperInvariant())
+                }
+            }
+        }
+    }
+
+    return @($letters | Select-Object -Unique)
+}
+
 function Write-SpooferVolumeSector {
     <#
     .SYNOPSIS
         Writes a run of sectors back to a volume, locking or dismounting it first.
+    .DESCRIPTION
+        -AllowDismount is ignored for the system volume and for any volume
+        holding a paging file: force-dismounting either one crashes Windows. On
+        those the volume has to be lockable, or the write is refused.
     #>
     [CmdletBinding()]
     param(
@@ -401,7 +445,13 @@ function Write-SpooferVolumeSector {
     if (($ByteOffset % $SectorSize) -ne 0)   { throw "ByteOffset $ByteOffset is not a multiple of the $SectorSize-byte sector size." }
     if (($Data.Length % $SectorSize) -ne 0)  { throw "Data length $($Data.Length) is not a multiple of the $SectorSize-byte sector size." }
 
-    $path = '\\.\{0}:' -f $DriveLetter.ToUpperInvariant()
+    $letter = $DriveLetter.ToUpperInvariant()
+    if ($AllowDismount -and (@(Get-SpooferUndismountableVolume) -contains $letter)) {
+        Write-SpooferLog -Level Debug -Message "${letter}: is the system volume or holds a paging file; it will be locked or left alone, never dismounted."
+        $AllowDismount = [switch]$false
+    }
+
+    $path = '\\.\{0}:' -f $letter
     [Spoofer.Native]::WriteSectors($path, $ByteOffset, $Data, [bool]$AllowDismount)
 }
 
@@ -451,6 +501,7 @@ Export-ModuleMember -Function @(
     'Enable-SpooferPrivilege'
     'Enable-SpooferPrivilegeSet'
     'Read-SpooferVolumeSector'
+    'Get-SpooferUndismountableVolume'
     'Write-SpooferVolumeSector'
     'Read-SpooferBootSector'
     'Write-SpooferBootSector'

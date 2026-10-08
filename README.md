@@ -160,7 +160,7 @@ Run `.\Spoofer.ps1 -Action Modules` for the current list with full detail.
 | `networkprofile` | Advanced | Network profile GUIDs, and with them the record of every network joined |
 | `productid` | Risky | The Windows `ProductId` string |
 | `digitalproductid` | Risky | The `DigitalProductId` blobs - the binary form of the installed product key |
-| `volumeserial` | Risky | The `XXXX-XXXX` serial in every volume's boot record, NTFS backup sectors and exFAT checksums included |
+| `volumeserial` | Risky | The `XXXX-XXXX` serial in every volume's boot record, NTFS backup sectors and exFAT checksums included. Skips the system volume and paging-file volumes |
 | `browser` | Risky | Cookies, local and session storage, IndexedDB and service workers, for every browser profile |
 | `interfaceguid` | Risky | The GUID of each network adapter, in all five places Windows records it, undone on the spot if any one of them fails (needs a restart) |
 
